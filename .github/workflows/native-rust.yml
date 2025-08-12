@@ -11,11 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      # Ensure Python can import your package from the repo root
-      PYTHONPATH: ${{ github.workspace }}:${{ env.PYTHONPATH }}
     steps:
       - uses: actions/checkout@v4
+
+      # Make your repo importable as a package (append to existing PYTHONPATH)
+      - name: "Export PYTHONPATH"
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
