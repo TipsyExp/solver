@@ -272,17 +272,24 @@ impl SolverNative {
     /// returns a dict mapping action names to probabilities.  Unknown NodeIds
     /// return a uniform distribution over actions.
 fn query<'py>(&self, py: Python<'py>, state: &PyDict) -> PyResult<&'py PyDict> {
-    // Required field: street (string)
-    let street_any = state
-        .get_item("street")?
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("state missing street"))?;
-    let street_str: String = street_any.extract()?;
-    let street = match street_str.as_str() {
-        "preflop" => 0u8,
-        "flop" => 1u8,
-        "turn"  => 2u8,
-        "river" => 3u8,
-        _ => 0u8,
+    // street: accept string ("preflop"/"flop"/"turn"/"river"), or int 0..3, or default to 0 (preflop)
+    let street: u8 = match state.get_item("street")? {
+        Some(obj) => {
+            if let Ok(s) = obj.extract::<&str>() {
+                match s {
+                    "preflop" => 0,
+                    "flop" => 1,
+                    "turn" => 2,
+                    "river" => 3,
+                    _ => 0,
+                }
+            } else if let Ok(i) = obj.extract::<u8>() {
+                if i <= 3 { i } else { 0 }
+            } else {
+                0
+            }
+        }
+        None => 0,
     };
 
     // Optional fields with defaults
@@ -319,6 +326,7 @@ fn query<'py>(&self, py: Python<'py>, state: &PyDict) -> PyResult<&'py PyDict> {
     }
     Ok(out)
 }
+
 }
 
 #[pymodule]
