@@ -1,0 +1,23 @@
+{
+  "name": "hu-solver-native",
+  "build": { "dockerfile": "Dockerfile" },
+  "features": {},
+  "postCreateCommand": "pip install -U pip maturin numpy jsonschema pyyaml",
+  "customizations": {
+    "vscode": {
+      "settings": { "python.defaultInterpreterPath": "/usr/local/bin/python" },
+      "extensions": ["ms-python.python", "rust-lang.rust-analyzer"]
+    }
+  }
+}
+
+.devcontainer/Dockerfile
+FROM mcr.microsoft.com/devcontainers/python:3.11
+
+# Install Rust toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y && \
+    . $HOME/.cargo/env && \
+    rustup default stable && \
+    echo 'source $HOME/.cargo/env' >> /etc/bash.bashrc
+
+ENV PATH="/root/.cargo/bin:${PATH}"
