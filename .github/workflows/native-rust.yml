@@ -1,10 +1,16 @@
 # .github/workflows/native-rust.yml
 name: native-rust
+
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+
+concurrency:
+  group: native-rust-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-test-smoke:
@@ -15,7 +21,8 @@ jobs:
       - uses: actions/checkout@v4
 
       # Make your repo importable as a package (append to existing PYTHONPATH)
-      - name: "Export PYTHONPATH"
+      - name: Export PYTHONPATH
+        shell: bash
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
@@ -23,16 +30,16 @@ jobs:
           python-version: '3.11'
 
       # Ensure Rust is available for pyo3 builds
-      - name: "Install Rust toolchain"
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: "Install Python deps"
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install maturin numpy jsonschema pyyaml
 
       # Build a wheel and pip install it (system site)
-      - name: "Build + install native wheel"
+      - name: Build + install native wheel
         working-directory: hu_solver/native
         run: |
           maturin build --release -i python3.11 --out dist
@@ -43,7 +50,7 @@ jobs:
           print("Location:", hu_solver_native.__file__)
           PY
 
-      - name: "Sanity: show layout and importability"
+      - name: Sanity: show layout and importability
         run: |
           pwd
           ls -R
@@ -57,19 +64,19 @@ jobs:
           print("find_spec('hu_solver.tests.test_determinism'):", importlib.util.find_spec("hu_solver.tests.test_determinism"))
           PY
 
-      - name: "Run unit tests"
+      - name: Run unit tests
         run: |
           python -m unittest discover -v -s hu_solver/tests
 
       # Optional smoke training (uncomment later when Solver + config exist)
-      # - name: "Produce smoke policy"
+      # - name: Produce smoke policy
       #   run: |
       #     python - <<'PY'
       #     from hu_solver.solver import Solver
       #     s = Solver("hu_solver/configs/hu_100bb.yaml")
       #     s.train(iters=200_000, out_dir="policies/hu_100bb_v1_smoke")
       #     PY
-      # - name: "Upload smoke artifacts"
+      # - name: Upload smoke artifacts
       #   uses: actions/upload-artifact@v4
       #   with:
       #     name: hu_100bb_v1_smoke
