@@ -118,7 +118,7 @@ impl SolverNative {
         for i in 0..iters {
             let iter_seed = derive_iter_seed(self.seed, self.iterations + i);
             let mut rng = StdRng::seed_from_u64(iter_seed);
-            for (&node_id, &idx) in self.node_map.iter() {
+            for (_node_id, &idx) in self.node_map.iter() {
                 // Generate pseudo‑random positive weights
                 let mut vals: Vec<f64> = (0..self.num_actions)
                     .map(|_| rng.gen_range(0.0f64..1.0))
@@ -271,42 +271,54 @@ impl SolverNative {
     /// (always 0) because full abstractions are not yet integrated.  The method
     /// returns a dict mapping action names to probabilities.  Unknown NodeIds
     /// return a uniform distribution over actions.
-    fn query<'py>(&self, py: Python<'py>, state: &PyDict) -> PyResult<&'py PyDict> {
-        // Extract basic fields
-        let street_obj = state.get_item("street").ok_or_else(|| pyo3::exceptions::PyValueError::new_err("state missing street"))?;
-        let street_str: String = street_obj.extract()?;
-        let street = match street_str.as_str() {
-            "preflop" => 0u8,
-            "flop" => 1u8,
-            "turn" => 2u8,
-            "river" => 3u8,
-            _ => 0u8,
-        };
-        let to_call: f64 = state.get_item("to_call").and_then(|v| v.extract().ok()).unwrap_or(0.0);
-        let last_raise: f64 = state.get_item("last_raise").and_then(|v| v.extract().ok()).unwrap_or(0.0);
-        let pos: u8 = state.get_item("pos").and_then(|v| v.extract().ok()).unwrap_or(0u8);
-        // Always treat jam as legal; this can be refined by SPR rule
-        let bet_state_id = build_bet_state_id(to_call, last_raise, true, pos, street);
-        // Use stub buckets 0
-        let node_id = build_node_id(0, 0, bet_state_id, street);
-        // Build output
-        let out = PyDict::new(py);
-        if let Some(&row) = self.node_map.get(&node_id) {
-            let probs = &self.avg_strategy[row];
-            let sum: f64 = probs.iter().sum();
-            let normaliser = if sum > 0.0 { sum } else { self.num_actions as f64 };
-            for (i, key) in self.action_keys.iter().enumerate() {
-                let p = probs[i] / normaliser;
-                out.set_item(key, p as f64)?;
-            }
-        } else {
-            let uniform = 1.0f64 / (self.num_actions as f64);
-            for key in &self.action_keys {
-                out.set_item(key, uniform)?;
-            }
+fn query<'py>(&self, py: Python<'py>, state: &PyDict) -> PyResult<&'py PyDict> {
+    // Required field: street (string)
+    let street_any = state
+        .get_item("street")?
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("state missing street"))?;
+    let street_str: String = street_any.extract()?;
+    let street = match street_str.as_str() {
+        "preflop" => 0u8,
+        "flop" => 1u8,
+        "turn"  => 2u8,
+        "river" => 3u8,
+        _ => 0u8,
+    };
+
+    // Optional fields with defaults
+    let to_call: f64 = match state.get_item("to_call")? {
+        Some(v) => v.extract().unwrap_or(0.0),
+        None => 0.0,
+    };
+    let last_raise: f64 = match state.get_item("last_raise")? {
+        Some(v) => v.extract().unwrap_or(0.0),
+        None => 0.0,
+    };
+    let pos: u8 = match state.get_item("pos")? {
+        Some(v) => v.extract().unwrap_or(0u8),
+        None => 0u8,
+    };
+
+    let bet_state_id = build_bet_state_id(to_call, last_raise, true, pos, street);
+    let node_id = build_node_id(0, 0, bet_state_id, street);
+
+    let out = PyDict::new(py);
+    if let Some(&row) = self.node_map.get(&node_id) {
+        let probs = &self.avg_strategy[row];
+        let sum: f64 = probs.iter().sum();
+        let normaliser = if sum > 0.0 { sum } else { self.num_actions as f64 };
+        for (i, key) in self.action_keys.iter().enumerate() {
+            let p = probs[i] / normaliser;
+            out.set_item(key, p as f64)?;
         }
-        Ok(out)
+    } else {
+        let uniform = 1.0f64 / (self.num_actions as f64);
+        for key in &self.action_keys {
+            out.set_item(key, uniform)?;
+        }
     }
+    Ok(out)
+}
 }
 
 #[pymodule]
