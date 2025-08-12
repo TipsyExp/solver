@@ -50,7 +50,8 @@ jobs:
           print("Location:", hu_solver_native.__file__)
           PY
 
-      - name: Sanity: show layout and importability
+      - name: "Sanity: show layout and importability"
+        shell: bash
         run: |
           pwd
           ls -R
