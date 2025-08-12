@@ -1,3 +1,4 @@
+# .github/workflows/native-rust.yml
 name: native-rust
 on:
   push:
@@ -15,23 +16,32 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Ensure Rust is available for pyo3 builds
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install maturin numpy jsonschema pyyaml
 
-      - name: Build native module (pyo3 via maturin)
+      # ✅ Build a wheel and pip install it (no venv needed)
+      - name: Build + install native wheel
         working-directory: hu_solver/native
         run: |
-          maturin develop --release
-          python -c "import hu_solver_native; print('Built:', hu_solver_native)"
+          maturin build --release -i python3.11 --out dist
+          pip install --force-reinstall dist/*.whl
+          python - <<'PY'
+          import hu_solver_native, sys
+          print("Built:", hu_solver_native.__name__)
+          print("Location:", hu_solver_native.__file__)
+          PY
 
       - name: Run unit tests
         run: |
-          # your existing tests; these now import the compiled module
           python -m hu_solver.tests.test_determinism
           python -m hu_solver.tests.test_schema_validation
-          python -m hu_solver.toy.kuhn  # quick convergence smoke
+          python -m hu_solver.toy.kuhn
 
       - name: Produce smoke policy
         run: |
@@ -45,5 +55,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hu_100bb_v1_smoke
-          path: |
-            policies/hu_100bb_v1_smoke/**
+          path: policies/hu_100bb_v1_smoke/**
