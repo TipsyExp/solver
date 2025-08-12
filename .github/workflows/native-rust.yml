@@ -1,0 +1,49 @@
+name: native-rust
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-test-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin numpy jsonschema pyyaml
+
+      - name: Build native module (pyo3 via maturin)
+        working-directory: hu_solver/native
+        run: |
+          maturin develop --release
+          python -c "import hu_solver_native; print('Built:', hu_solver_native)"
+
+      - name: Run unit tests
+        run: |
+          # your existing tests; these now import the compiled module
+          python -m hu_solver.tests.test_determinism
+          python -m hu_solver.tests.test_schema_validation
+          python -m hu_solver.toy.kuhn  # quick convergence smoke
+
+      - name: Produce smoke policy
+        run: |
+          python - <<'PY'
+          from hu_solver.solver import Solver
+          s = Solver("hu_solver/configs/hu_100bb.yaml")
+          s.train(iters=200_000, out_dir="policies/hu_100bb_v1_smoke")
+          PY
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hu_100bb_v1_smoke
+          path: |
+            policies/hu_100bb_v1_smoke/**
