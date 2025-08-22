@@ -161,8 +161,8 @@ impl SolverNative {
 
     /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
     /// Matches tests: train(iters, out_dir)
-    #[pyo3(signature = (iters=None, out_dir))]
-    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
+    #[pyo3(signature = (out_dir, iters=None))]
+    fn train(&mut self, iters: out_dir: &str>, Option<u64) -> PyResult<()> {
         let iters = iters.unwrap_or(120_000);
         create_dir_all(out_dir).ok();
         for i in 0..iters {
