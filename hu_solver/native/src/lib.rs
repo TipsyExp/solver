@@ -5,7 +5,6 @@ use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
@@ -39,7 +38,6 @@ fn round_half_to_even(x: f64) -> f64 {
     } else if r < 0.5 {
         f
     } else {
-        // tie: to nearest even
         if (f as i64) % 2 == 0 { f } else { f + 1.0 }
     }
 }
@@ -102,10 +100,10 @@ struct SolverNative {
     // discrete sizes by street (defaults if not in config)
     preflop_sizes: Vec<String>, // ["2.5x", "8x", "jam"]
     flop_sizes: Vec<String>,    // ["0.33p","0.75p","1.25p","jam"]
-    // mapping: NodeId -> row index
+    // mapping: NodeId -> row index (sorted)
     nodes: BTreeMap<u64, usize>,
     // regrets/avg
-    regrets: Vec<f32>,    // rows * ACTIONS_PER_NODE
+    regrets: Vec<f32>,      // rows * ACTIONS_PER_NODE
     strategy_sum: Vec<f32>, // rows * ACTIONS_PER_NODE
     // policy snapshot saved on save_policy()
     policy_rows: Vec<f32>, // flattened per-row distribution
@@ -129,7 +127,6 @@ impl SolverNative {
     }
 
     /// Optional: load config YAML if you want sizes from file (seed too).
-    #[pyo3(text_signature = "($self, config_path)")]
     fn load_config_yaml(&mut self, config_path: &str) -> PyResult<()> {
         let mut f = File::open(config_path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open config: {e}")))?;
@@ -152,12 +149,11 @@ impl SolverNative {
     }
 
     /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
-    /// iters ~100k–300k for smoke. Keep CI small; default 120_000 here.
-    #[pyo3(text_signature = "($self, iters, out_dir)")]
+    /// default iters kept CI-small.
+    #[pyo3(signature = (iters=None, out_dir))]
     fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
         let iters = iters.unwrap_or(120_000);
         create_dir_all(out_dir).ok();
-        // simple loop: sample a node each iter, apply CFR+ update with a deterministic payoff
         for i in 0..iters {
             let iter_seed = splitmix64(self.seed ^ (i + 1));
             let mut rng = StdRng::seed_from_u64(iter_seed);
@@ -184,8 +180,7 @@ impl SolverNative {
                 }
             }
 
-            // deterministic value vector (toy payoff) for convergence:
-            // tie value to (row index) so policy becomes non-uniform deterministically
+            // deterministic toy payoff for convergence (non-uniform, stable)
             let mut v = [0f32; ACTIONS_PER_NODE];
             for a in 0..ACTIONS_PER_NODE {
                 if legal_mask[a] {
@@ -202,7 +197,7 @@ impl SolverNative {
                 if legal_mask[a] {
                     let idx = base + a;
                     let r = self.regrets[idx] + (v[a] - u);
-                    self.regrets[idx] = r.max(0.0); // CFR+ clamped
+                    self.regrets[idx] = r.max(0.0);
                 }
             }
             // accumulate average strategy (linear averaging)
@@ -211,7 +206,6 @@ impl SolverNative {
             }
 
             if i % 50_000 == 0 {
-                // write a tiny metrics CSV append
                 let mut mf = File::options()
                     .create(true)
                     .append(true)
@@ -226,15 +220,14 @@ impl SolverNative {
 
     /// Save policy.bin (v1, 32-byte header), index.bin (NodeId->offset),
     /// and meta.json with checksums and discrete_sizes.
-    #[pyo3(text_signature = "($self, out_dir)")]
     fn save_policy(&mut self, out_dir: &str) -> PyResult<()> {
         create_dir_all(out_dir).ok();
 
         // 1) Build average policy rows from strategy_sum
         let rows = self.nodes.len();
         self.policy_rows.resize(rows * ACTIONS_PER_NODE, 0.0);
-        for (i, (_node, row)) in self.nodes.iter().enumerate() {
-            let base = row * ACTIONS_PER_NODE;
+        for (_nid, row) in self.nodes.iter() {
+            let base = *row * ACTIONS_PER_NODE;
             let slice = &self.strategy_sum[base..base + ACTIONS_PER_NODE];
             let s: f32 = slice.iter().sum();
             let out = &mut self.policy_rows[base..base + ACTIONS_PER_NODE];
@@ -243,7 +236,6 @@ impl SolverNative {
                     out[a] = slice[a] / s;
                 }
             } else {
-                // uniform as fallback
                 for a in 0..ACTIONS_PER_NODE {
                     out[a] = 1.0 / (ACTIONS_PER_NODE as f32);
                 }
@@ -286,11 +278,9 @@ impl SolverNative {
         // 4) index.bin: (node_id: u64, offset: u64) sorted by node_id
         let mut idxf = File::create(format!("{out_dir}/index.bin"))?;
         let mut offset: u64 = 0; // bytes into policy body
-        for (_node_id, row) in &self.nodes {
-            let node_id = *self.nodes.iter().find(|(_nid, r)| *r == row).unwrap().0;
-            let off = offset;
+        for (node_id, _row) in &self.nodes {
             idxf.write_all(&node_id.to_le_bytes())?;
-            idxf.write_all(&off.to_le_bytes())?;
+            idxf.write_all(&offset.to_le_bytes())?;
             offset += (ACTIONS_PER_NODE * 4) as u64; // 4 bytes per float
         }
 
@@ -333,9 +323,7 @@ impl SolverNative {
         Ok(())
     }
 
-    #[pyo3(text_signature = "($self, out_dir)")]
     fn load_policy(&mut self, out_dir: &str) -> PyResult<()> {
-        // read policy header
         let mut f = File::open(format!("{out_dir}/policy.bin"))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{e}")))?;
         let mut head = [0u8; 32];
@@ -369,7 +357,6 @@ impl SolverNative {
             self.policy_rows[i] = f32::from_le_bytes(arr);
         }
 
-        // rebuild a trivial nodes map with two rows (fallback)
         if self.nodes.is_empty() {
             self.init_nodes();
         }
@@ -377,33 +364,36 @@ impl SolverNative {
     }
 
     /// query(state_dict) -> {action: prob} using saved/avg policy rows
-    #[pyo3(text_signature = "($self, state)")]
     fn query(&self, py: Python<'_>, state: &PyDict) -> PyResult<PyObject> {
-        let street: u8 = state.get_item("street").ok_or_else(|| err("missing street"))?
-            .extract::<u8>()?;
-        let to_call: f32 = state.get_item("to_call").ok_or_else(|| err("missing to_call"))?
-            .extract::<f32>()?;
-        let last_raise: f32 = state.get_item("last_raise").ok_or_else(|| err("missing last_raise"))?
-            .extract::<f32>()?;
-        let pos: u8 = state.get_item("pos").ok_or_else(|| err("missing pos"))?
-            .extract::<u8>()?;
+        // Force PyDict::get_item (returns Option<&PyAny>) to avoid PyAny::get_item (Result).
+        let street: u8 = PyDict::get_item(state, "street")
+            .ok_or_else(|| err("missing street"))?
+            .extract()?;
+        let to_call: f32 = PyDict::get_item(state, "to_call")
+            .ok_or_else(|| err("missing to_call"))?
+            .extract()?;
+        let last_raise: f32 = PyDict::get_item(state, "last_raise")
+            .ok_or_else(|| err("missing last_raise"))?
+            .extract()?;
+        let pos: u8 = PyDict::get_item(state, "pos")
+            .ok_or_else(|| err("missing pos"))?
+            .extract()?;
 
-        let jam_legal = true; // documented rule: jam allowed when stack permits (assumed)
+        let jam_legal = true; // documented rule: jam allowed when stack permits (assumed true in tiny slice)
         let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
-        // tiny slice: we default to bucket 0 unless provided
-        let board_bucket: u16 = state.get_item("board_bucket").and_then(|o| o.extract().ok()).unwrap_or(0);
-        let hand_bucket: u16 = state.get_item("hand_bucket").and_then(|o| o.extract().ok()).unwrap_or(0);
+
+        // optional buckets (default 0)
+        let board_bucket: u16 = PyDict::get_item(state, "board_bucket")
+            .and_then(|o| o.extract::<u16>().ok())
+            .unwrap_or(0);
+        let hand_bucket: u16 = PyDict::get_item(state, "hand_bucket")
+            .and_then(|o| o.extract::<u16>().ok())
+            .unwrap_or(0);
+
         let nid = pack_node_id(board_bucket, hand_bucket, bsi, street);
 
-        // find row
-        let mut row_idx = None;
-        if let Some((_k, r)) = self.nodes.iter().find(|(k, _)| **k == nid) {
-            row_idx = Some(**r);
-        } else {
-            // fallback: row 0
-            row_idx = Some(0);
-        }
-        let row = row_idx.unwrap();
+        // resolve row (fallback to 0 if not present)
+        let row = self.nodes.get(&nid).copied().unwrap_or(0);
         let base = row * ACTIONS_PER_NODE;
 
         // legal mask by street
@@ -411,17 +401,17 @@ impl SolverNative {
         legal[0] = true; // fold
         legal[1] = true; // check/call
         match street {
-            0 => { // preflop: map sizes A/B/C to [2.5x, 8x] and jam
-                legal[2] = true; // size slot A (2.5x)
-                legal[3] = true; // size slot B (8x)
-                legal[4] = false; // size C not used preflop
+            0 => { // preflop
+                legal[2] = true; // size A (2.5x)
+                legal[3] = true; // size B (8x)
+                legal[4] = false; // size C unused preflop
                 legal[5] = true; // jam
             }
-            1 => { // flop: map to [0.33p, 0.75p, 1.25p]
-                legal[2] = true;
-                legal[3] = true;
-                legal[4] = true;
-                legal[5] = true; // jam allowed if stack permits (assumed true in tiny slice)
+            1 => { // flop
+                legal[2] = true; // 0.33p
+                legal[3] = true; // 0.75p
+                legal[4] = true; // 1.25p
+                legal[5] = true; // jam
             }
             _ => {}
         }
@@ -436,7 +426,6 @@ impl SolverNative {
             sum += v;
         }
         if sum <= 0.0 {
-            // uniform over legal
             let k = legal.iter().filter(|&&b| b).count().max(1) as f32;
             for a in 0..ACTIONS_PER_NODE {
                 probs[a] = if legal[a] { 1.0 / k } else { 0.0 };
@@ -466,17 +455,15 @@ fn yaml_val_to_size(v: &serde_yaml::Value) -> String {
         _ => "jam".to_string(),
     }
 }
-fn err(msg: &str) -> pyo3::exceptions::PyValueError {
+fn err(msg: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(msg.to_string())
 }
 
 impl SolverNative {
     fn init_nodes(&mut self) {
         // Build tiny HU slice: preflop (street=0) and flop (street=1),
-        // FLOP_BUCKETS × HAND_BUCKETS × 2 positions × a small BetStateId set.
-        // For simplicity, enumerate BetStateId over a tiny grid:
-        // to_call_q in {0, 8}, last_raise_q in {0, 16}, jam in {0,1}
-        // pos in {0,1}.
+        // FLOP_BUCKETS × HAND_BUCKETS × 2 positions × small BetStateId grid.
+        // Grid: to_call_q in {0, 8}, last_raise_q in {0, 16}, jam in {0,1}, pos in {0,1}.
         let mut pairs: Vec<(u64, usize)> = Vec::new();
         let mut row = 0usize;
 
@@ -514,7 +501,6 @@ impl SolverNative {
     fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
         let rows = self.nodes.len();
         let idx = (rng.gen::<u64>() as usize) % rows;
-        // legal mask depends on street bits of NodeId
         let node_id = self.nodes.iter().nth(idx).unwrap().0;
         let street = ((node_id >> 8) & 0x3) as u8;
         let mut mask = [false; ACTIONS_PER_NODE];
