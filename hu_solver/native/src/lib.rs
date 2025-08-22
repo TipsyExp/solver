@@ -161,8 +161,8 @@ impl SolverNative {
 
     /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
     /// Matches tests: train(iters, out_dir)
-    #[pyo3(signature = (out_dir, iters=None))]
-    fn train(&mut self, out_dir: &str, iters: Option<u64>) -> PyResult<()> {
+    #[pyo3(signature = (iters, out_dir))]
+    fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
         let iters = iters.unwrap_or(120_000);
         create_dir_all(out_dir).ok();
         for i in 0..iters {
@@ -419,27 +419,43 @@ impl SolverNative {
         }
 
         // read row; mask and renormalize
-        let mut probs = [0f32; ACTIONS_PER_NODE];
-        let mut sum = 0f32;
+        let mut probs = [0f64; ACTIONS_PER_NODE];
+        let mut sum = 0f64;
         for a in 0..ACTIONS_PER_NODE {
-            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0);
+            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0) as f64;
             let v = if legal[a] { p } else { 0.0 };
             probs[a] = v;
             sum += v;
         }
-        if sum <= 0.0 {
-            let k = legal.iter().filter(|&&b| b).count().max(1) as f32;
-            for a in 0..ACTIONS_PER_NODE {
-                probs[a] = if legal[a] { 1.0 / k } else { 0.0 };
+        
+        // normalize
+        let mut legal_idxs: Vec<usize> = (0..ACTIONS_PER_NODE).filter(|&i| legal[i]).collect();
+        if legal_idxs.is_empty() {   
+          // nothing legal: all zeros (unlikely in this toy slice)
+        } else if sum <= 0.0 {
+          // uniform over legal
+             let k = legal_idxs.len() as f64;
+            for &i in &legal_idxs {
+               probs[i] = 1.0 / k;
             }
         } else {
-            for a in 0..ACTIONS_PER_NODE {
-                probs[a] /= sum;
-            }
+            for &i in &legal_idxs {
+                probs[i] /= sum;
+           }
         }
+        // exact-sum adjustment: set the largest entry to 1 - sum(others)
+        if !legal_idxs.is_empty() {
+            let mut idx_max = legal_idxs[0];
+            for &i in &legal_idxs {
+                if probs[i] > probs[idx_max] {
+                    idx_max = i;
+                }
+            }
+            let sum_others: f64 = legal_idxs.iter().copied().filter(|&i| i != idx_max).map(|i| probs[i]).sum();
+            probs[idx_max] = 1.0 - sum_others;
+       }     
 
         // Build output dict (Bound)
-        let out = PyDict::new_bound(py);
         out.set_item("fold", probs[0])?;
         out.set_item("check_call", probs[1])?;
         out.set_item("size_A", probs[2])?;
@@ -535,7 +551,8 @@ impl SolverNative {
     fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
         let rows = self.nodes.len();
         let idx = (rng.gen::<u64>() as usize) % rows;
-        let node_id = self.nodes.iter().nth(idx).unwrap().0;
+        let (node_id, row_idx) = self.nodes.iter().nth(idx).unwrap();
+        let row = *row_idx;
         let street = ((node_id >> 8) & 0x3) as u8;
         let mut mask = [false; ACTIONS_PER_NODE];
         mask[0] = true;
@@ -551,7 +568,7 @@ impl SolverNative {
             mask[4] = true;
             mask[5] = true;
         }
-        (idx, mask)
+        (row, mask)
     }
 }
 
