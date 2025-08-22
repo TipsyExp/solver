@@ -527,3 +527,4 @@ fn hu_solver_native(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<SolverNative>()?;
     Ok(())
 }
+
