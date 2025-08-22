@@ -10,7 +10,7 @@ class TestPolicyIO(unittest.TestCase):
             self.skipTest("native module not available")
         with tempfile.TemporaryDirectory() as d:
             s1 = SolverNative(seed=42)
-            s1.train(5, d)
+            s1.train(5, d)            # tiny/fast
             s1.save_policy(d)
 
             s2 = SolverNative(seed=999)
@@ -20,9 +20,6 @@ class TestPolicyIO(unittest.TestCase):
             a = s1.query(state)
             b = s2.query(state)
 
-            self.assertEqual(a, b)
+            self.assertEqual(a, b)  # policy-consistent
             self.assertAlmostEqual(sum(a.values()), 1.0, places=9)
             self.assertTrue(all(0.0 <= v <= 1.0 for v in a.values()))
-
-if __name__ == "__main__":
-    unittest.main()
