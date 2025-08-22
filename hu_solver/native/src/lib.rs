@@ -1,5 +1,9 @@
+// src/lib.rs
+
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyModule};
+use pyo3::Bound;
+
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde::Deserialize;
@@ -37,8 +41,10 @@ fn round_half_to_even(x: f64) -> f64 {
         f + 1.0
     } else if r < 0.5 {
         f
+    } else if (f as i64) % 2 == 0 {
+        f
     } else {
-        if (f as i64) % 2 == 0 { f } else { f + 1.0 }
+        f + 1.0
     }
 }
 fn q4_quantize(bb: f32) -> u16 {
@@ -150,8 +156,8 @@ impl SolverNative {
 
     /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
     /// default iters kept CI-small.
-    #[pyo3(signature = (iters=None, out_dir))]
-    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
+    #[pyo3(signature = (out_dir, iters=None))]
+    fn train(&mut self, out_dir: &str, iters: Option<u64>) -> PyResult<()> {
         let iters = iters.unwrap_or(120_000);
         create_dir_all(out_dir).ok();
         for i in 0..iters {
@@ -365,28 +371,34 @@ impl SolverNative {
 
     /// query(state_dict) -> {action: prob} using saved/avg policy rows
     fn query(&self, py: Python<'_>, state: &PyDict) -> PyResult<PyObject> {
-        // Force PyDict::get_item (returns Option<&PyAny>) to avoid PyAny::get_item (Result).
-        let street: u8 = PyDict::get_item(state, "street")
+        // Required keys
+        let street: u8 = state
+            .get_item("street")?
             .ok_or_else(|| err("missing street"))?
             .extract()?;
-        let to_call: f32 = PyDict::get_item(state, "to_call")
+        let to_call: f32 = state
+            .get_item("to_call")?
             .ok_or_else(|| err("missing to_call"))?
             .extract()?;
-        let last_raise: f32 = PyDict::get_item(state, "last_raise")
+        let last_raise: f32 = state
+            .get_item("last_raise")?
             .ok_or_else(|| err("missing last_raise"))?
             .extract()?;
-        let pos: u8 = PyDict::get_item(state, "pos")
+        let pos: u8 = state
+            .get_item("pos")?
             .ok_or_else(|| err("missing pos"))?
             .extract()?;
 
         let jam_legal = true; // documented rule: jam allowed when stack permits (assumed true in tiny slice)
         let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
 
-        // optional buckets (default 0)
-        let board_bucket: u16 = PyDict::get_item(state, "board_bucket")
+        // Optional buckets (default 0)
+        let board_bucket: u16 = state
+            .get_item("board_bucket")?
             .and_then(|o| o.extract::<u16>().ok())
             .unwrap_or(0);
-        let hand_bucket: u16 = PyDict::get_item(state, "hand_bucket")
+        let hand_bucket: u16 = state
+            .get_item("hand_bucket")?
             .and_then(|o| o.extract::<u16>().ok())
             .unwrap_or(0);
 
@@ -436,6 +448,7 @@ impl SolverNative {
             }
         }
 
+        // Build output dict
         let out = PyDict::new(py);
         out.set_item("fold", probs[0])?;
         out.set_item("check_call", probs[1])?;
@@ -523,8 +536,7 @@ impl SolverNative {
 
 /// ---- module export ----
 #[pymodule]
-fn hu_solver_native(_py: Python, m: &PyModule) -> PyResult<()> {
+fn hu_solver_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SolverNative>()?;
     Ok(())
 }
-
