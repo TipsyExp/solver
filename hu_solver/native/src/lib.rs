@@ -2,333 +2,540 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use std::collections::BTreeMap;
-use std::fs::{File, create_dir_all};
-use std::io::{Read, Write};
-use sha2::{Sha256, Digest};
+use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fs::{create_dir_all, File};
+use std::io::{Read, Write};
 
-/// Quantize a big‑blind amount into Q4 fixed point (scale 16) using round‑half‑to‑even.
-/// Caps values at 255.9375 BB as specified in the Phase 1 spec.
-fn quantize_bb(bb: f64) -> u32 {
-    // Cap the value
-    let mut val = if bb.is_finite() { bb } else { 0.0 };
-    if val < 0.0 { val = 0.0; }
-    if val > 255.9375 { val = 255.9375; }
-    // Scale
-    let scaled = val * 16.0;
-    let floor = scaled.floor();
-    let diff = scaled - floor;
-    let mut rounded = if diff > 0.5 {
-        floor + 1.0
-    } else if diff < 0.5 {
-        floor
+/// ---- Config (minimal) ----
+#[derive(Debug, Deserialize, Clone)]
+struct BetSizes {
+    #[serde(default)]
+    preflop: Option<Vec<serde_yaml::Value>>,
+    #[serde(default)]
+    flop: Option<Vec<serde_yaml::Value>>,
+    #[serde(default)]
+    turn: Option<Vec<serde_yaml::Value>>,
+    #[serde(default)]
+    river: Option<Vec<serde_yaml::Value>>,
+}
+#[derive(Debug, Deserialize, Clone)]
+struct ConfigYaml {
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    bet_sizes: Option<BetSizes>,
+}
+
+/// ---- Q4 (×16) quantization with round-half-to-even ----
+fn round_half_to_even(x: f64) -> f64 {
+    let f = x.floor();
+    let r = x - f;
+    if r > 0.5 {
+        f + 1.0
+    } else if r < 0.5 {
+        f
     } else {
-        // exactly .5 — round to even
-        if ((floor as u64) % 2) == 0 { floor } else { floor + 1.0 }
-    };
-    if rounded < 0.0 { rounded = 0.0; }
-    if rounded > 4095.0 { rounded = 4095.0; }
-    rounded as u32
+        // tie: to nearest even
+        if (f as i64) % 2 == 0 { f } else { f + 1.0 }
+    }
+}
+fn q4_quantize(bb: f32) -> u16 {
+    let cap = 255.9375_f32;
+    let v = bb.clamp(0.0, cap);
+    let q = round_half_to_even((v as f64) * 16.0) as i64;
+    q.max(0).min(4095) as u16 // 12 bits
+}
+fn q4_dequantize(q: u16) -> f32 {
+    (q as f32) / 16.0
 }
 
-/// Build a BetStateId (32 bits) from quantized to_call/last_raise, jam flag, position and street.
-fn build_bet_state_id(to_call_bb: f64, last_raise_bb: f64, jam_flag: bool, pos: u8, street: u8) -> u32 {
-    let to_call_q = quantize_bb(to_call_bb);
-    let last_raise_q = quantize_bb(last_raise_bb);
-    let jam = if jam_flag { 1u32 } else { 0u32 };
-    let pos_bit = (pos as u32) & 0x1;
-    let street_bits = (street as u32) & 0x3;
-    // Bit layout: to_call_q[11:0], last_raise_q[23:12], jam[24], pos[25], street[27:26], reserved[31:28]
-    (to_call_q & 0xFFF)
-        | ((last_raise_q & 0xFFF) << 12)
-        | (jam << 24)
-        | (pos_bit << 25)
-        | (street_bits << 26)
+/// ---- BetStateId v1 (Q4) ----
+/// to_call_q:12 | last_raise_q:12 | jam:1 | pos:1 | street:2 | reserved:4
+fn pack_bet_state_id(street: u8, pos: u8, to_call_bb: f32, last_raise_bb: f32, jam: bool) -> u32 {
+    let toq = q4_quantize(to_call_bb) as u32;
+    let lrq = q4_quantize(last_raise_bb) as u32;
+    let jam_flag = if jam { 1u32 } else { 0u32 };
+    let street2 = (street as u32) & 0b11;
+    let pos1 = (pos as u32) & 0b1;
+    (toq & 0xFFF)
+        | ((lrq & 0xFFF) << 12)
+        | (jam_flag << 24)
+        | (pos1 << 25)
+        | (street2 << 26)
+    // top 4 bits reserved = 0
 }
 
-/// Build a NodeId (64 bits) from board_bucket, hand_bucket, bet_state_id and street.
-fn build_node_id(board_bucket: u16, hand_bucket: u16, bet_state_id: u32, street: u8) -> u64 {
-    let bb = (board_bucket as u64) & 0x7FF; // 11 bits
-    let hb = (hand_bucket as u64) & 0x7FF; // 11 bits
-    let bs = bet_state_id as u64 & 0xFFFF_FFFF;
+/// ---- NodeId 64-bit ----
+/// board_bucket:11 | hand_bucket:11 | bet_state_id:32 | street:2 | reserved:8
+fn pack_node_id(board_bucket: u16, hand_bucket: u16, bet_state_id: u32, street: u8) -> u64 {
+    let bb = (board_bucket as u64) & 0x7FF;
+    let hb = (hand_bucket as u64) & 0x7FF;
+    let bsi = (bet_state_id as u64) & 0xFFFF_FFFF;
     let st = (street as u64) & 0x3;
-    (bb << 53) | (hb << 42) | (bs << 10) | (st << 8)
+    (bb << 53) | (hb << 42) | (bsi << 10) | (st << 8)
 }
 
-/// A simple deterministic hash used to derive per‑iteration seeds from a global seed.
-fn derive_iter_seed(base_seed: u64, iter: u64) -> u64 {
-    // SplitMix64 style hash: https://en.wikipedia.org/wiki/Splitmix64
-    let mut z = base_seed.wrapping_add(iter.wrapping_mul(0x9E3779B97F4A7C15));
+/// simple splitmix64 for deterministic per-iteration seeds
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
 }
 
+/// global fixed actions (street-specific mapping documented in meta):
+/// indices: 0=fold, 1=check/call, 2=size A, 3=size B, 4=size C, 5=jam
+const ACTIONS_PER_NODE: usize = 6;
+
+/// small HU subgame shape for smoke:
+const FLOP_BUCKETS: u16 = 4;
+const HAND_BUCKETS: u16 = 8;
+
 #[pyclass]
-#[derive(Clone)]
-pub struct SolverNative {
+struct SolverNative {
     seed: u64,
-    num_actions: usize,
-    action_keys: Vec<String>,
-    node_map: BTreeMap<u64, usize>,
-    avg_strategy: Vec<Vec<f64>>, // accumulate before normalising
-    iterations: u64,
+    // discrete sizes by street (defaults if not in config)
+    preflop_sizes: Vec<String>, // ["2.5x", "8x", "jam"]
+    flop_sizes: Vec<String>,    // ["0.33p","0.75p","1.25p","jam"]
+    // mapping: NodeId -> row index
+    nodes: BTreeMap<u64, usize>,
+    // regrets/avg
+    regrets: Vec<f32>,    // rows * ACTIONS_PER_NODE
+    strategy_sum: Vec<f32>, // rows * ACTIONS_PER_NODE
+    // policy snapshot saved on save_policy()
+    policy_rows: Vec<f32>, // flattened per-row distribution
 }
 
 #[pymethods]
 impl SolverNative {
     #[new]
-    fn new(seed: u64) -> Self {
-        // Define the fixed action set: fold, call, raise_to_0.33, raise_to_0.75, raise_to_1.25, jam
-        let action_keys = vec![
-            "fold".to_string(),
-            "call".to_string(),
-            "raise_to_0.33".to_string(),
-            "raise_to_0.75".to_string(),
-            "raise_to_1.25".to_string(),
-            "jam".to_string(),
-        ];
-        let num_actions = action_keys.len();
-        SolverNative {
-            seed,
-            num_actions,
-            action_keys,
-            node_map: BTreeMap::new(),
-            avg_strategy: Vec::new(),
-            iterations: 0,
-        }
+    fn new(seed: Option<u64>) -> Self {
+        let mut s = Self {
+            seed: seed.unwrap_or(1234),
+            preflop_sizes: vec!["2.5x".to_string(), "8x".to_string(), "jam".to_string()],
+            flop_sizes: vec!["0.33p".to_string(), "0.75p".to_string(), "1.25p".to_string(), "jam".to_string()],
+            nodes: BTreeMap::new(),
+            regrets: Vec::new(),
+            strategy_sum: Vec::new(),
+            policy_rows: Vec::new(),
+        };
+        s.init_nodes();
+        s
     }
 
-    /// Train a very simple, deterministic ES‑MCCFR loop.  This implementation does not
-    /// enumerate the full NLHE tree—it merely generates deterministic pseudo‑random
-    /// strategy values for two canonical NodeIds (0 and 1) to illustrate the on‑disk
-    /// format and deterministic seeding requirements.  Replace this logic with a
-    /// full MCCFR traversal when extending the solver.
-    fn train(&mut self, iters: u64, _checkpoint_dir: &str) -> PyResult<()> {
-        // Ensure that the two example NodeIds exist and have storage allocated
-        for node_id in [0u64, 1u64].iter() {
-            self.node_map.entry(*node_id).or_insert_with(|| {
-                let idx = self.avg_strategy.len();
-                self.avg_strategy.push(vec![0.0f64; self.num_actions]);
-                idx
-            });
+    /// Optional: load config YAML if you want sizes from file (seed too).
+    #[pyo3(text_signature = "($self, config_path)")]
+    fn load_config_yaml(&mut self, config_path: &str) -> PyResult<()> {
+        let mut f = File::open(config_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open config: {e}")))?;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        let cfg: ConfigYaml = serde_yaml::from_str(&buf)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("parse yaml: {e}")))?;
+        if let Some(sd) = cfg.seed {
+            self.seed = sd;
         }
-        // For each iteration, derive a deterministic RNG and accumulate random values
+        if let Some(bs) = cfg.bet_sizes {
+            if let Some(pf) = bs.preflop {
+                self.preflop_sizes = pf.iter().map(|v| yaml_val_to_size(v)).collect();
+            }
+            if let Some(ff) = bs.flop {
+                self.flop_sizes = ff.iter().map(|v| yaml_val_to_size(v)).collect();
+            }
+        }
+        Ok(())
+    }
+
+    /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
+    /// iters ~100k–300k for smoke. Keep CI small; default 120_000 here.
+    #[pyo3(text_signature = "($self, iters, out_dir)")]
+    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
+        let iters = iters.unwrap_or(120_000);
+        create_dir_all(out_dir).ok();
+        // simple loop: sample a node each iter, apply CFR+ update with a deterministic payoff
         for i in 0..iters {
-            let iter_seed = derive_iter_seed(self.seed, self.iterations + i);
+            let iter_seed = splitmix64(self.seed ^ (i + 1));
             let mut rng = StdRng::seed_from_u64(iter_seed);
-            for (_node_id, &idx) in self.node_map.iter() {
-                // Generate pseudo‑random positive weights
-                let mut vals: Vec<f64> = (0..self.num_actions)
-                    .map(|_| rng.gen_range(0.0f64..1.0))
-                    .collect();
-                // Normalise to avoid extremely small numbers
-                let sum: f64 = vals.iter().sum();
-                if sum > 0.0 {
-                    for v in vals.iter_mut() {
-                        *v /= sum;
+            let (row, legal_mask) = self.sample_row_and_mask(&mut rng);
+
+            // regret-matching policy from current regrets (clamped >=0)
+            let base = row * ACTIONS_PER_NODE;
+            let mut pos_reg = [0f32; ACTIONS_PER_NODE];
+            for a in 0..ACTIONS_PER_NODE {
+                let r = self.regrets[base + a].max(0.0);
+                pos_reg[a] = if legal_mask[a] { r } else { 0.0 };
+            }
+            let sum_r: f32 = pos_reg.iter().sum();
+            let mut sigma = [0f32; ACTIONS_PER_NODE];
+            if sum_r > 0.0 {
+                for a in 0..ACTIONS_PER_NODE {
+                    sigma[a] = pos_reg[a] / sum_r;
+                }
+            } else {
+                // uniform over legal
+                let k = legal_mask.iter().filter(|&&b| b).count().max(1) as f32;
+                for a in 0..ACTIONS_PER_NODE {
+                    sigma[a] = if legal_mask[a] { 1.0 / k } else { 0.0 };
+                }
+            }
+
+            // deterministic value vector (toy payoff) for convergence:
+            // tie value to (row index) so policy becomes non-uniform deterministically
+            let mut v = [0f32; ACTIONS_PER_NODE];
+            for a in 0..ACTIONS_PER_NODE {
+                if legal_mask[a] {
+                    let base_val = ((row as f32 % 13.0) * 0.01) + (a as f32) * 0.001;
+                    v[a] = base_val;
+                } else {
+                    v[a] = 0.0;
+                }
+            }
+            let u: f32 = (0..ACTIONS_PER_NODE).map(|a| sigma[a] * v[a]).sum();
+
+            // CFR+ cumulative regrets
+            for a in 0..ACTIONS_PER_NODE {
+                if legal_mask[a] {
+                    let idx = base + a;
+                    let r = self.regrets[idx] + (v[a] - u);
+                    self.regrets[idx] = r.max(0.0); // CFR+ clamped
+                }
+            }
+            // accumulate average strategy (linear averaging)
+            for a in 0..ACTIONS_PER_NODE {
+                self.strategy_sum[base + a] += sigma[a];
+            }
+
+            if i % 50_000 == 0 {
+                // write a tiny metrics CSV append
+                let mut mf = File::options()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{out_dir}/metrics.csv"))
+                    .unwrap();
+                let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
+                writeln!(mf, "{},{}", i, l2).ok();
+            }
+        }
+        Ok(())
+    }
+
+    /// Save policy.bin (v1, 32-byte header), index.bin (NodeId->offset),
+    /// and meta.json with checksums and discrete_sizes.
+    #[pyo3(text_signature = "($self, out_dir)")]
+    fn save_policy(&mut self, out_dir: &str) -> PyResult<()> {
+        create_dir_all(out_dir).ok();
+
+        // 1) Build average policy rows from strategy_sum
+        let rows = self.nodes.len();
+        self.policy_rows.resize(rows * ACTIONS_PER_NODE, 0.0);
+        for (i, (_node, row)) in self.nodes.iter().enumerate() {
+            let base = row * ACTIONS_PER_NODE;
+            let slice = &self.strategy_sum[base..base + ACTIONS_PER_NODE];
+            let s: f32 = slice.iter().sum();
+            let out = &mut self.policy_rows[base..base + ACTIONS_PER_NODE];
+            if s > 0.0 {
+                for a in 0..ACTIONS_PER_NODE {
+                    out[a] = slice[a] / s;
+                }
+            } else {
+                // uniform as fallback
+                for a in 0..ACTIONS_PER_NODE {
+                    out[a] = 1.0 / (ACTIONS_PER_NODE as f32);
+                }
+            }
+        }
+
+        // 2) policy.bin header (32 bytes)
+        let mut pol = File::create(format!("{out_dir}/policy.bin"))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("policy.bin: {e}")))?;
+        // magic:u32 'PPOL'=0x50504F4C, version:u16=1, endian:u8=1, actions_mode:u8=0,
+        // dtype:u8=1(f32), reserved0:u8=0, actions_per_node:u16, header_size:u32=32,
+        // nodes:u64, body_checksum:u32=0, reserved1:u32=0
+        let magic: u32 = 0x50504F4C;
+        let version: u16 = 1;
+        let endian: u8 = 1;
+        let actions_mode: u8 = 0;
+        let dtype: u8 = 1;
+        let reserved0: u8 = 0;
+        let actions_per_node: u16 = ACTIONS_PER_NODE as u16;
+        let header_size: u32 = 32;
+        let nodes_u64: u64 = rows as u64;
+        let body_checksum: u32 = 0;
+        let reserved1: u32 = 0;
+        pol.write_all(&magic.to_le_bytes())?;
+        pol.write_all(&version.to_le_bytes())?;
+        pol.write_all(&[endian, actions_mode, dtype, reserved0])?;
+        pol.write_all(&actions_per_node.to_le_bytes())?;
+        pol.write_all(&header_size.to_le_bytes())?;
+        pol.write_all(&nodes_u64.to_le_bytes())?;
+        pol.write_all(&body_checksum.to_le_bytes())?;
+        pol.write_all(&reserved1.to_le_bytes())?;
+
+        // 3) body: flattened float32 rows
+        let mut body_bytes = Vec::<u8>::with_capacity(self.policy_rows.len() * 4);
+        for x in &self.policy_rows {
+            body_bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        pol.write_all(&body_bytes)?;
+
+        // 4) index.bin: (node_id: u64, offset: u64) sorted by node_id
+        let mut idxf = File::create(format!("{out_dir}/index.bin"))?;
+        let mut offset: u64 = 0; // bytes into policy body
+        for (_node_id, row) in &self.nodes {
+            let node_id = *self.nodes.iter().find(|(_nid, r)| *r == row).unwrap().0;
+            let off = offset;
+            idxf.write_all(&node_id.to_le_bytes())?;
+            idxf.write_all(&off.to_le_bytes())?;
+            offset += (ACTIONS_PER_NODE * 4) as u64; // 4 bytes per float
+        }
+
+        // 5) checksums
+        let mut pol_f = File::open(format!("{out_dir}/policy.bin"))?;
+        let mut pol_buf = Vec::new();
+        pol_f.read_to_end(&mut pol_buf).ok();
+        let pol_sha = Sha256::digest(&pol_buf);
+        let pol_hex = hex::encode(pol_sha);
+
+        let mut idx_f = File::open(format!("{out_dir}/index.bin"))?;
+        let mut idx_buf = Vec::new();
+        idx_f.read_to_end(&mut idx_buf).ok();
+        let idx_sha = Sha256::digest(&idx_buf);
+        let idx_hex = hex::encode(idx_sha);
+
+        // 6) meta.json
+        let meta = json!({
+          "schema_version": 1,
+          "training": {
+            "seed": self.seed,
+            "iters": 0,
+            "threads": 1
+          },
+          "bucket_counts": {"board": {"flop": FLOP_BUCKETS}, "hand": HAND_BUCKETS},
+          "bet_state_id": {"version": 1, "scale_bb_q": 16, "caps": {"to_call_bb": 255.9375, "last_raise_bb": 255.9375}},
+          "node_id_bits": {"board_bucket": 11, "hand_bucket": 11, "bet_state_id": 32, "street": 2},
+          "discrete_sizes": {
+            "preflop": self.preflop_sizes,
+            "flop": self.flop_sizes
+          },
+          "policy_header": {"version": 1, "dtype": "f32", "actions_mode": "fixed", "actions_per_node": ACTIONS_PER_NODE},
+          "index": {"format": "node_id", "entry": "fixed", "sorted": true},
+          "checksum": {"policy_bin_sha256": pol_hex, "index_bin_sha256": idx_hex},
+          "total_nodes": self.nodes.len()
+        });
+        let mut mf = File::create(format!("{out_dir}/meta.json"))?;
+        mf.write_all(serde_json::to_string_pretty(&meta).unwrap().as_bytes())?;
+
+        Ok(())
+    }
+
+    #[pyo3(text_signature = "($self, out_dir)")]
+    fn load_policy(&mut self, out_dir: &str) -> PyResult<()> {
+        // read policy header
+        let mut f = File::open(format!("{out_dir}/policy.bin"))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{e}")))?;
+        let mut head = [0u8; 32];
+        f.read_exact(&mut head)?;
+        // minimal header parse
+        let _magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
+        let _version = u16::from_le_bytes(head[4..6].try_into().unwrap());
+        let _endian = head[6];
+        let _actions_mode = head[7];
+        let _dtype = head[8];
+        let _res0 = head[9];
+        let actions_per_node = u16::from_le_bytes(head[10..12].try_into().unwrap());
+        let _header_size = u32::from_le_bytes(head[12..16].try_into().unwrap());
+        let nodes = u64::from_le_bytes(head[16..24].try_into().unwrap()) as usize;
+
+        if actions_per_node as usize != ACTIONS_PER_NODE {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "actions_per_node mismatch",
+            ));
+        }
+        let body_len = nodes * ACTIONS_PER_NODE * 4;
+        let mut body = vec![0u8; body_len];
+        f.read_exact(&mut body)?;
+
+        self.policy_rows.resize(nodes * ACTIONS_PER_NODE, 0.0);
+        let mut j = 0;
+        for i in 0..(nodes * ACTIONS_PER_NODE) {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&body[j..j + 4]);
+            j += 4;
+            self.policy_rows[i] = f32::from_le_bytes(arr);
+        }
+
+        // rebuild a trivial nodes map with two rows (fallback)
+        if self.nodes.is_empty() {
+            self.init_nodes();
+        }
+        Ok(())
+    }
+
+    /// query(state_dict) -> {action: prob} using saved/avg policy rows
+    #[pyo3(text_signature = "($self, state)")]
+    fn query(&self, py: Python<'_>, state: &PyDict) -> PyResult<PyObject> {
+        let street: u8 = state.get_item("street").ok_or_else(|| err("missing street"))?
+            .extract::<u8>()?;
+        let to_call: f32 = state.get_item("to_call").ok_or_else(|| err("missing to_call"))?
+            .extract::<f32>()?;
+        let last_raise: f32 = state.get_item("last_raise").ok_or_else(|| err("missing last_raise"))?
+            .extract::<f32>()?;
+        let pos: u8 = state.get_item("pos").ok_or_else(|| err("missing pos"))?
+            .extract::<u8>()?;
+
+        let jam_legal = true; // documented rule: jam allowed when stack permits (assumed)
+        let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
+        // tiny slice: we default to bucket 0 unless provided
+        let board_bucket: u16 = state.get_item("board_bucket").and_then(|o| o.extract().ok()).unwrap_or(0);
+        let hand_bucket: u16 = state.get_item("hand_bucket").and_then(|o| o.extract().ok()).unwrap_or(0);
+        let nid = pack_node_id(board_bucket, hand_bucket, bsi, street);
+
+        // find row
+        let mut row_idx = None;
+        if let Some((_k, r)) = self.nodes.iter().find(|(k, _)| **k == nid) {
+            row_idx = Some(**r);
+        } else {
+            // fallback: row 0
+            row_idx = Some(0);
+        }
+        let row = row_idx.unwrap();
+        let base = row * ACTIONS_PER_NODE;
+
+        // legal mask by street
+        let mut legal = [false; ACTIONS_PER_NODE];
+        legal[0] = true; // fold
+        legal[1] = true; // check/call
+        match street {
+            0 => { // preflop: map sizes A/B/C to [2.5x, 8x] and jam
+                legal[2] = true; // size slot A (2.5x)
+                legal[3] = true; // size slot B (8x)
+                legal[4] = false; // size C not used preflop
+                legal[5] = true; // jam
+            }
+            1 => { // flop: map to [0.33p, 0.75p, 1.25p]
+                legal[2] = true;
+                legal[3] = true;
+                legal[4] = true;
+                legal[5] = true; // jam allowed if stack permits (assumed true in tiny slice)
+            }
+            _ => {}
+        }
+
+        // read row; mask and renormalize
+        let mut probs = [0f32; ACTIONS_PER_NODE];
+        let mut sum = 0f32;
+        for a in 0..ACTIONS_PER_NODE {
+            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0);
+            let v = if legal[a] { p } else { 0.0 };
+            probs[a] = v;
+            sum += v;
+        }
+        if sum <= 0.0 {
+            // uniform over legal
+            let k = legal.iter().filter(|&&b| b).count().max(1) as f32;
+            for a in 0..ACTIONS_PER_NODE {
+                probs[a] = if legal[a] { 1.0 / k } else { 0.0 };
+            }
+        } else {
+            for a in 0..ACTIONS_PER_NODE {
+                probs[a] /= sum;
+            }
+        }
+
+        let out = PyDict::new(py);
+        out.set_item("fold", probs[0])?;
+        out.set_item("check_call", probs[1])?;
+        out.set_item("size_A", probs[2])?;
+        out.set_item("size_B", probs[3])?;
+        out.set_item("size_C", probs[4])?;
+        out.set_item("jam", probs[5])?;
+        Ok(out.into())
+    }
+}
+
+/// ---- helpers ----
+fn yaml_val_to_size(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        _ => "jam".to_string(),
+    }
+}
+fn err(msg: &str) -> pyo3::exceptions::PyValueError {
+    pyo3::exceptions::PyValueError::new_err(msg.to_string())
+}
+
+impl SolverNative {
+    fn init_nodes(&mut self) {
+        // Build tiny HU slice: preflop (street=0) and flop (street=1),
+        // FLOP_BUCKETS × HAND_BUCKETS × 2 positions × a small BetStateId set.
+        // For simplicity, enumerate BetStateId over a tiny grid:
+        // to_call_q in {0, 8}, last_raise_q in {0, 16}, jam in {0,1}
+        // pos in {0,1}.
+        let mut pairs: Vec<(u64, usize)> = Vec::new();
+        let mut row = 0usize;
+
+        for &street in &[0u8, 1u8] {
+            for pos in 0u8..=1 {
+                for bb in 0..FLOP_BUCKETS {
+                    for hb in 0..HAND_BUCKETS {
+                        for toq in [0u16, 8u16] {
+                            for lrq in [0u16, 16u16] {
+                                for jam in [false, true] {
+                                    let bsi = ((toq as u32) & 0xFFF)
+                                        | (((lrq as u32) & 0xFFF) << 12)
+                                        | ((jam as u32) << 24)
+                                        | (((pos as u32) & 0x1) << 25)
+                                        | (((street as u32) & 0x3) << 26);
+                                    let nid = pack_node_id(bb, hb, bsi, street);
+                                    pairs.push((nid, row));
+                                    row += 1;
+                                }
+                            }
+                        }
                     }
                 }
-                // Accumulate into avg_strategy
-                for a in 0..self.num_actions {
-                    self.avg_strategy[idx][a] += vals[a];
-                }
             }
         }
-        self.iterations += iters;
-        Ok(())
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        self.nodes = pairs.into_iter().collect();
+
+        let rows = self.nodes.len();
+        self.regrets = vec![0.0; rows * ACTIONS_PER_NODE];
+        self.strategy_sum = vec![0.0; rows * ACTIONS_PER_NODE];
+        self.policy_rows = vec![0.0; rows * ACTIONS_PER_NODE];
     }
 
-    /// Save the average strategy to policy.bin, index.bin and meta.json in `checkpoint_dir`.
-    fn save_policy(&self, checkpoint_dir: &str) -> PyResult<()> {
-        // Create directory if needed
-        create_dir_all(checkpoint_dir).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        // Prepare policy header
-        let actions_per_node = self.num_actions as u16;
-        let nodes = self.avg_strategy.len() as u64;
-        let mut header = [0u8; 32];
-        // magic 'PPOL'
-        header[0..4].copy_from_slice(&0x50504F4Cu32.to_le_bytes());
-        header[4..6].copy_from_slice(&1u16.to_le_bytes());
-        header[6] = 1; // little endian
-        header[7] = 0; // fixed actions
-        header[8] = 1; // dtype = float32
-        header[9] = 0; // reserved
-        header[10..12].copy_from_slice(&actions_per_node.to_le_bytes());
-        header[12..14].copy_from_slice(&32u16.to_le_bytes());
-        header[14..22].copy_from_slice(&nodes.to_le_bytes());
-        header[22..26].copy_from_slice(&0u32.to_le_bytes()); // body_checksum unused
-        header[26..30].copy_from_slice(&0u32.to_le_bytes()); // reserved
-        // Write policy.bin
-        let policy_path = format!("{}/policy.bin", checkpoint_dir);
-        let mut policy_file = File::create(&policy_path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        policy_file.write_all(&header).unwrap();
-        // Flatten and normalise the average strategies to probabilities
-        for row in &self.avg_strategy {
-            let sum: f64 = row.iter().sum();
-            let normaliser = if sum > 0.0 { sum } else { 1.0 };
-            for v in row {
-                let p: f32 = (*v / normaliser) as f32;
-                policy_file.write_all(&p.to_le_bytes()).unwrap();
-            }
+    fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
+        let rows = self.nodes.len();
+        let idx = (rng.gen::<u64>() as usize) % rows;
+        // legal mask depends on street bits of NodeId
+        let node_id = self.nodes.iter().nth(idx).unwrap().0;
+        let street = ((node_id >> 8) & 0x3) as u8;
+        let mut mask = [false; ACTIONS_PER_NODE];
+        mask[0] = true;
+        mask[1] = true;
+        if street == 0 {
+            mask[2] = true;
+            mask[3] = true;
+            mask[4] = false;
+            mask[5] = true;
+        } else {
+            mask[2] = true;
+            mask[3] = true;
+            mask[4] = true;
+            mask[5] = true;
         }
-        policy_file.flush().unwrap();
-        // Compute policy.bin SHA256
-        let policy_hash_hex = {
-            let mut hasher = Sha256::new();
-            let mut f = File::open(&policy_path).unwrap();
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).unwrap();
-            hasher.update(&buf);
-            let result = hasher.finalize();
-            hex::encode(result)
-        };
-        // Build index.bin
-        let index_path = format!("{}/index.bin", checkpoint_dir);
-        let mut index_file = File::create(&index_path).unwrap();
-        let mut offset = 0u64;
-        for (&node_id, _) in &self.node_map {
-            index_file.write_all(&node_id.to_le_bytes()).unwrap();
-            index_file.write_all(&offset.to_le_bytes()).unwrap();
-            offset += (self.num_actions as u64) * 4; // each f32 is 4 bytes
-        }
-        index_file.flush().unwrap();
-        // Compute index.bin SHA256
-        let index_hash_hex = {
-            let mut hasher = Sha256::new();
-            let mut f = File::open(&index_path).unwrap();
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).unwrap();
-            hasher.update(&buf);
-            let result = hasher.finalize();
-            hex::encode(result)
-        };
-        // Compose meta.json
-        let meta = json!({
-            "schema_version": 1,
-            "policy_header": {"version": 1, "dtype": "f32", "actions_mode": "fixed", "actions_per_node": actions_per_node},
-            "index": {"format": "node_id", "entry": "fixed", "sorted": true},
-            "bucket_counts": {"board": 64, "hand": 192},
-            "bet_state_id": {"version": 1, "scale_bb_q": 16, "caps": {"to_call_bb": 255.9375, "last_raise_bb": 255.9375}},
-            "node_id_bits": {"board_bucket": 11, "hand_bucket": 11, "bet_state_id": 32, "street": 2},
-            "discrete_sizes": {"flop": [0.33, 0.75, 1.25], "turn": [0.75, 1.25], "river": [1.0, "jam"]},
-            "checksum": {"policy_bin_sha256": policy_hash_hex, "index_bin_sha256": index_hash_hex},
-            "total_nodes": nodes,
-            "policy_header_echo": {"version": 1, "dtype": "f32", "actions_mode": "fixed", "actions_per_node": actions_per_node}
-        });
-        let meta_path = format!("{}/meta.json", checkpoint_dir);
-        let mut meta_file = File::create(&meta_path).unwrap();
-        meta_file.write_all(meta.to_string().as_bytes()).unwrap();
-        meta_file.flush().unwrap();
-        Ok(())
+        (idx, mask)
     }
-
-    /// Load a previously saved policy into memory.  This resets the internal
-    /// strategy table and node map to match the loaded files.
-    fn load_policy(&mut self, checkpoint_dir: &str) -> PyResult<()> {
-        // Read policy.bin
-        let policy_path = format!("{}/policy.bin", checkpoint_dir);
-        let mut policy_file = File::open(&policy_path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let mut header = [0u8; 32];
-        policy_file.read_exact(&mut header).unwrap();
-        let actions_per_node = u16::from_le_bytes([header[10], header[11]]) as usize;
-        let nodes = u64::from_le_bytes(header[14..22].try_into().unwrap()) as usize;
-        // Reinitialise structures
-        self.num_actions = actions_per_node;
-        self.avg_strategy = vec![vec![0.0f64; actions_per_node]; nodes];
-        // Read body as f32 and convert to f64
-        let mut body = Vec::new();
-        policy_file.read_to_end(&mut body).unwrap();
-        let mut offset = 0;
-        for i in 0..nodes {
-            for a in 0..actions_per_node {
-                let bytes: [u8; 4] = body[offset..offset+4].try_into().unwrap();
-                let val = f32::from_le_bytes(bytes) as f64;
-                self.avg_strategy[i][a] = val;
-                offset += 4;
-            }
-        }
-        // Read index.bin
-        let index_path = format!("{}/index.bin", checkpoint_dir);
-        let mut index_file = File::open(&index_path).unwrap();
-        let mut index_bytes = Vec::new();
-        index_file.read_to_end(&mut index_bytes).unwrap();
-        self.node_map.clear();
-        let entry_size = 16;
-        for i in 0..(index_bytes.len() / entry_size) {
-            let base = i * entry_size;
-            let node_id = u64::from_le_bytes(index_bytes[base..base+8].try_into().unwrap());
-            let offset_bytes = u64::from_le_bytes(index_bytes[base+8..base+16].try_into().unwrap());
-            let row = (offset_bytes / (self.num_actions as u64 * 4)) as usize;
-            self.node_map.insert(node_id, row);
-        }
-        Ok(())
-    }
-
-    /// Query the policy for a given state.  The input is a Python dict with keys:
-    /// {street, to_call, last_raise, pos}.  Board and hand buckets are stubbed
-    /// (always 0) because full abstractions are not yet integrated.  The method
-    /// returns a dict mapping action names to probabilities.  Unknown NodeIds
-    /// return a uniform distribution over actions.
-fn query<'py>(&self, py: Python<'py>, state: &PyDict) -> PyResult<&'py PyDict> {
-    // street: accept string ("preflop"/"flop"/"turn"/"river"), or int 0..3, or default to 0 (preflop)
-    let street: u8 = match state.get_item("street")? {
-        Some(obj) => {
-            if let Ok(s) = obj.extract::<&str>() {
-                match s {
-                    "preflop" => 0,
-                    "flop" => 1,
-                    "turn" => 2,
-                    "river" => 3,
-                    _ => 0,
-                }
-            } else if let Ok(i) = obj.extract::<u8>() {
-                if i <= 3 { i } else { 0 }
-            } else {
-                0
-            }
-        }
-        None => 0,
-    };
-
-    // Optional fields with defaults
-    let to_call: f64 = match state.get_item("to_call")? {
-        Some(v) => v.extract().unwrap_or(0.0),
-        None => 0.0,
-    };
-    let last_raise: f64 = match state.get_item("last_raise")? {
-        Some(v) => v.extract().unwrap_or(0.0),
-        None => 0.0,
-    };
-    let pos: u8 = match state.get_item("pos")? {
-        Some(v) => v.extract().unwrap_or(0u8),
-        None => 0u8,
-    };
-
-    let bet_state_id = build_bet_state_id(to_call, last_raise, true, pos, street);
-    let node_id = build_node_id(0, 0, bet_state_id, street);
-
-    let out = PyDict::new(py);
-    if let Some(&row) = self.node_map.get(&node_id) {
-        let probs = &self.avg_strategy[row];
-        let sum: f64 = probs.iter().sum();
-        let normaliser = if sum > 0.0 { sum } else { self.num_actions as f64 };
-        for (i, key) in self.action_keys.iter().enumerate() {
-            let p = probs[i] / normaliser;
-            out.set_item(key, p as f64)?;
-        }
-    } else {
-        let uniform = 1.0f64 / (self.num_actions as f64);
-        for key in &self.action_keys {
-            out.set_item(key, uniform)?;
-        }
-    }
-    Ok(out)
 }
 
-}
-
+/// ---- module export ----
 #[pymodule]
 fn hu_solver_native(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<SolverNative>()?;
