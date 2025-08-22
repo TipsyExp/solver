@@ -1,11 +1,9 @@
-// src/lib.rs
-
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use pyo3::Bound;
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -14,6 +12,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
 
 /// ---- Config (minimal) ----
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 struct BetSizes {
     #[serde(default)]
@@ -53,6 +52,7 @@ fn q4_quantize(bb: f32) -> u16 {
     let q = round_half_to_even((v as f64) * 16.0) as i64;
     q.max(0).min(4095) as u16 // 12 bits
 }
+#[allow(dead_code)]
 fn q4_dequantize(q: u16) -> f32 {
     (q as f32) / 16.0
 }
@@ -122,7 +122,12 @@ impl SolverNative {
         let mut s = Self {
             seed: seed.unwrap_or(1234),
             preflop_sizes: vec!["2.5x".to_string(), "8x".to_string(), "jam".to_string()],
-            flop_sizes: vec!["0.33p".to_string(), "0.75p".to_string(), "1.25p".to_string(), "jam".to_string()],
+            flop_sizes: vec![
+                "0.33p".to_string(),
+                "0.75p".to_string(),
+                "1.25p".to_string(),
+                "jam".to_string(),
+            ],
             nodes: BTreeMap::new(),
             regrets: Vec::new(),
             strategy_sum: Vec::new(),
@@ -155,9 +160,9 @@ impl SolverNative {
     }
 
     /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
-    /// default iters kept CI-small.
-    #[pyo3(signature = (out_dir, iters=None))]
-    fn train(&mut self, out_dir: &str, iters: Option<u64>) -> PyResult<()> {
+    /// Matches tests: train(iters, out_dir)
+    #[pyo3(signature = (iters=None, out_dir))]
+    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
         let iters = iters.unwrap_or(120_000);
         create_dir_all(out_dir).ok();
         for i in 0..iters {
@@ -370,37 +375,20 @@ impl SolverNative {
     }
 
     /// query(state_dict) -> {action: prob} using saved/avg policy rows
-    fn query(&self, py: Python<'_>, state: &PyDict) -> PyResult<PyObject> {
-        // Required keys
-        let street: u8 = state
-            .get_item("street")?
-            .ok_or_else(|| err("missing street"))?
-            .extract()?;
-        let to_call: f32 = state
-            .get_item("to_call")?
-            .ok_or_else(|| err("missing to_call"))?
-            .extract()?;
-        let last_raise: f32 = state
-            .get_item("last_raise")?
-            .ok_or_else(|| err("missing last_raise"))?
-            .extract()?;
-        let pos: u8 = state
-            .get_item("pos")?
-            .ok_or_else(|| err("missing pos"))?
-            .extract()?;
+    fn query(&self, py: Python<'_>, state: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+        // Required-ish keys (now tolerant with aliases + defaults)
+        let street: u8 = get_u8(state, &["street", "st", "street_id"])?.unwrap_or(1);
+        let to_call: f32 = get_f32(state, &["to_call", "to_call_bb", "call"])?.unwrap_or(0.0);
+        let last_raise: f32 =
+            get_f32(state, &["last_raise", "last_raise_bb", "raise"])?.unwrap_or(0.0);
+        let pos: u8 = get_u8(state, &["pos", "position", "player"])?.unwrap_or(0);
 
-        let jam_legal = true; // documented rule: jam allowed when stack permits (assumed true in tiny slice)
+        let jam_legal = true; // tiny slice assumption
         let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
 
-        // Optional buckets (default 0)
-        let board_bucket: u16 = state
-            .get_item("board_bucket")?
-            .and_then(|o| o.extract::<u16>().ok())
-            .unwrap_or(0);
-        let hand_bucket: u16 = state
-            .get_item("hand_bucket")?
-            .and_then(|o| o.extract::<u16>().ok())
-            .unwrap_or(0);
+        // optional buckets (default 0)
+        let board_bucket: u16 = get_u16(state, &["board_bucket", "bbucket", "bb"])?.unwrap_or(0);
+        let hand_bucket: u16 = get_u16(state, &["hand_bucket", "hbucket", "hb"])?.unwrap_or(0);
 
         let nid = pack_node_id(board_bucket, hand_bucket, bsi, street);
 
@@ -413,13 +401,15 @@ impl SolverNative {
         legal[0] = true; // fold
         legal[1] = true; // check/call
         match street {
-            0 => { // preflop
+            0 => {
+                // preflop
                 legal[2] = true; // size A (2.5x)
                 legal[3] = true; // size B (8x)
                 legal[4] = false; // size C unused preflop
                 legal[5] = true; // jam
             }
-            1 => { // flop
+            1 => {
+                // flop
                 legal[2] = true; // 0.33p
                 legal[3] = true; // 0.75p
                 legal[4] = true; // 1.25p
@@ -448,15 +438,15 @@ impl SolverNative {
             }
         }
 
-        // Build output dict
-        let out = PyDict::new(py);
+        // Build output dict (Bound)
+        let out = PyDict::new_bound(py);
         out.set_item("fold", probs[0])?;
         out.set_item("check_call", probs[1])?;
         out.set_item("size_A", probs[2])?;
         out.set_item("size_B", probs[3])?;
         out.set_item("size_C", probs[4])?;
         out.set_item("jam", probs[5])?;
-        Ok(out.into())
+        Ok(out.into_py(py))
     }
 }
 
@@ -470,6 +460,37 @@ fn yaml_val_to_size(v: &serde_yaml::Value) -> String {
 }
 fn err(msg: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(msg.to_string())
+}
+
+fn get_u8(state: &Bound<'_, PyDict>, keys: &[&str]) -> PyResult<Option<u8>> {
+    for &k in keys {
+        if let Some(v) = state.get_item(k)? {
+            if let Ok(val) = v.extract::<u8>() {
+                return Ok(Some(val));
+            }
+        }
+    }
+    Ok(None)
+}
+fn get_u16(state: &Bound<'_, PyDict>, keys: &[&str]) -> PyResult<Option<u16>> {
+    for &k in keys {
+        if let Some(v) = state.get_item(k)? {
+            if let Ok(val) = v.extract::<u16>() {
+                return Ok(Some(val));
+            }
+        }
+    }
+    Ok(None)
+}
+fn get_f32(state: &Bound<'_, PyDict>, keys: &[&str]) -> PyResult<Option<f32>> {
+    for &k in keys {
+        if let Some(v) = state.get_item(k)? {
+            if let Ok(val) = v.extract::<f32>() {
+                return Ok(Some(val));
+            }
+        }
+    }
+    Ok(None)
 }
 
 impl SolverNative {
