@@ -163,7 +163,7 @@ impl SolverNative {
     /// Matches tests: train(iters, out_dir)
     #[pyo3(signature = (iters, out_dir))]
     fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
-        let iters = iters.unwrap_or(120_000);
+        let iters = if iters == 0 { 120_000 } else { iters };
         create_dir_all(out_dir).ok();
         for i in 0..iters {
             let iter_seed = splitmix64(self.seed ^ (i + 1));
@@ -456,6 +456,7 @@ impl SolverNative {
        }     
 
         // Build output dict (Bound)
+        let out = PyDict::new_bound(py);
         out.set_item("fold", probs[0])?;
         out.set_item("check_call", probs[1])?;
         out.set_item("size_A", probs[2])?;
