@@ -7,6 +7,7 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use plotters::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
