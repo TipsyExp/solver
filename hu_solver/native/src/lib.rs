@@ -160,76 +160,106 @@ impl SolverNative {
         Ok(())
     }
 
-    /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
-    /// Matches tests: train(iters, out_dir)
-    #[pyo3(signature = (iters, out_dir))]
-    fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
-        let iters = if iters == 0 { 120_000 } else { iters };
-        create_dir_all(out_dir).ok();
-        for i in 0..iters {
-            let iter_seed = splitmix64(self.seed ^ (i + 1));
-            let mut rng = StdRng::seed_from_u64(iter_seed);
-            let (row, legal_mask) = self.sample_row_and_mask(&mut rng);
+#[pyo3(signature = (iters, out_dir))]
+fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
+    let iters = if iters == 0 { 120_000 } else { iters };
+    create_dir_all(out_dir).ok();
 
-            // regret-matching policy from current regrets (clamped >=0)
-            let base = row * ACTIONS_PER_NODE;
-            let mut pos_reg = [0f32; ACTIONS_PER_NODE];
-            for a in 0..ACTIONS_PER_NODE {
-                let r = self.regrets[base + a].max(0.0);
-                pos_reg[a] = if legal_mask[a] { r } else { 0.0 };
-            }
-            let sum_r: f32 = pos_reg.iter().sum();
-            let mut sigma = [0f32; ACTIONS_PER_NODE];
-            if sum_r > 0.0 {
-                for a in 0..ACTIONS_PER_NODE {
-                    sigma[a] = pos_reg[a] / sum_r;
-                }
-            } else {
-                // uniform over legal
-                let k = legal_mask.iter().filter(|&&b| b).count().max(1) as f32;
-                for a in 0..ACTIONS_PER_NODE {
-                    sigma[a] = if legal_mask[a] { 1.0 / k } else { 0.0 };
-                }
-            }
+    // collect (iteration, l2_regret_norm) so we can plot at the end
+    let mut metrics: Vec<(u64, f32)> = Vec::new();
 
-            // deterministic toy payoff for convergence (non-uniform, stable)
-            let mut v = [0f32; ACTIONS_PER_NODE];
-            for a in 0..ACTIONS_PER_NODE {
-                if legal_mask[a] {
-                    let base_val = ((row as f32 % 13.0) * 0.01) + (a as f32) * 0.001;
-                    v[a] = base_val;
-                } else {
-                    v[a] = 0.0;
-                }
-            }
-            let u: f32 = (0..ACTIONS_PER_NODE).map(|a| sigma[a] * v[a]).sum();
+    for i in 0..iters {
+        let iter_seed = splitmix64(self.seed ^ (i + 1));
+        let mut rng = StdRng::seed_from_u64(iter_seed);
+        let (row, legal_mask) = self.sample_row_and_mask(&mut rng);
 
-            // CFR+ cumulative regrets
+        // regret-matching policy from current regrets (clamped >=0)
+        let base = row * ACTIONS_PER_NODE;
+        let mut pos_reg = [0f32; ACTIONS_PER_NODE];
+        for a in 0..ACTIONS_PER_NODE {
+            let r = self.regrets[base + a].max(0.0);
+            pos_reg[a] = if legal_mask[a] { r } else { 0.0 };
+        }
+        let sum_r: f32 = pos_reg.iter().sum();
+        let mut sigma = [0f32; ACTIONS_PER_NODE];
+        if sum_r > 0.0 {
             for a in 0..ACTIONS_PER_NODE {
-                if legal_mask[a] {
-                    let idx = base + a;
-                    let r = self.regrets[idx] + (v[a] - u);
-                    self.regrets[idx] = r.max(0.0);
-                }
+                sigma[a] = pos_reg[a] / sum_r;
             }
-            // accumulate average strategy (linear averaging)
+        } else {
+            // uniform over legal
+            let k = legal_mask.iter().filter(|&&b| b).count().max(1) as f32;
             for a in 0..ACTIONS_PER_NODE {
-                self.strategy_sum[base + a] += sigma[a];
-            }
-
-            if i % 50_000 == 0 {
-                let mut mf = File::options()
-                    .create(true)
-                    .append(true)
-                    .open(format!("{out_dir}/metrics.csv"))
-                    .unwrap();
-                let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
-                writeln!(mf, "{},{}", i, l2).ok();
-                if let Err(e) = write_policy_and_index(out_dir, &self.policy_rows, &self.nodes) { eprintln!("warn: failed to write policy/index: {:?}", e); }
+                sigma[a] = if legal_mask[a] { 1.0 / k } else { 0.0 };
             }
         }
-        Ok(())
+
+        // deterministic toy payoff for convergence (non-uniform, stable)
+        let mut v = [0f32; ACTIONS_PER_NODE];
+        for a in 0..ACTIONS_PER_NODE {
+            if legal_mask[a] {
+                let base_val = ((row as f32 % 13.0) * 0.01) + (a as f32) * 0.001;
+                v[a] = base_val;
+            } else {
+                v[a] = 0.0;
+            }
+        }
+        let u: f32 = (0..ACTIONS_PER_NODE).map(|a| sigma[a] * v[a]).sum();
+
+        // CFR+ cumulative regrets
+        for a in 0..ACTIONS_PER_NODE {
+            if legal_mask[a] {
+                let idx = base + a;
+                let r = self.regrets[idx] + (v[a] - u);
+                self.regrets[idx] = r.max(0.0);
+            }
+        }
+        // accumulate average strategy (linear averaging)
+        for a in 0..ACTIONS_PER_NODE {
+            self.strategy_sum[base + a] += sigma[a];
+        }
+
+        if i % 50_000 == 0 {
+            let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
+            metrics.push((i, l2));
+            let mut mf = File::options()
+                .create(true)
+                .append(true)
+                .open(format!("{}/metrics.csv", out_dir))
+                .unwrap();
+            writeln!(mf, "{},{}", i, l2).ok();
+
+            // periodic checkpoint files for tests/tooling
+            if let Err(e) = write_policy_and_index(out_dir, &self.policy_rows, &self.nodes) {
+                eprintln!("warn: failed to write policy/index: {:?}", e);
+            }
+        }
     }
+
+    // final metrics row + checkpoint
+    let l2_final: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
+    metrics.push((iters, l2_final));
+    {
+        let mut mf = File::options()
+            .create(true)
+            .append(true)
+            .open(format!("{}/metrics.csv", out_dir))
+            .unwrap();
+        writeln!(mf, "{},{}", iters, l2_final).ok();
+    }
+    if let Err(e) = write_policy_and_index(out_dir, &self.policy_rows, &self.nodes) {
+        eprintln!("warn: failed to write policy/index: {:?}", e);
+    }
+
+    // finally, write the PNG plot
+    let plot_path = format!("{}/metrics_plot.png", out_dir);
+    if let Err(e) = write_metrics_plot(&metrics, &plot_path) {
+        eprintln!("warn: failed to write metrics_plot.png: {:?}", e);
+    }
+
+    Ok(())
+}
+
 
     /// Save policy.bin (v1, 32-byte header), index.bin (NodeId->offset),
     /// and meta.json with checksums and discrete_sizes.
