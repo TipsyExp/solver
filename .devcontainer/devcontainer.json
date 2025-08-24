@@ -1,20 +1,14 @@
 {
   "name": "hu-solver-dev",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
-  "postCreateCommand": "python -m pip install --upgrade pip && pip install maturin numpy jsonschema pyyaml",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl && curl -sSf https://sh.rustup.rs | sh -s -- -y && echo 'source $HOME/.cargo/env' >> ~/.bashrc && . $HOME/.cargo/env && rustup default stable && python -m pip install --upgrade pip && pip install maturin numpy jsonschema pyyaml",
   "customizations": {
     "vscode": {
-      "settings": {
-        "python.defaultInterpreterPath": "/usr/local/bin/python"
-      },
       "extensions": [
         "ms-python.python",
         "rust-lang.rust-analyzer",
         "ms-toolsai.jupyter"
       ]
     }
-  },
-  "remoteUser": "vscode"
+  }
 }
