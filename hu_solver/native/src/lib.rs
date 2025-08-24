@@ -225,6 +225,7 @@ impl SolverNative {
                     .unwrap();
                 let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
                 writeln!(mf, "{},{}", i, l2).ok();
+                if let Err(e) = write_policy_and_index(out_dir, &self.policy_rows, &self.nodes) { eprintln!("warn: failed to write policy/index: {:?}", e); }
             }
         }
         Ok(())
@@ -578,5 +579,33 @@ impl SolverNative {
 #[pymodule]
 fn hu_solver_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SolverNative>()?;
+    Ok(())
+}
+
+// === added helper for tests/checkpoints ===
+fn write_policy_and_index(
+    out_dir: &str,
+    policy_rows: &[f32],
+    nodes: &std::collections::BTreeMap<u64, usize>,
+) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    // policy.bin: 32-byte header then f32 LE body
+    let policy_path = format!("{}/policy.bin", out_dir);
+    let mut pf = File::create(&policy_path)?;
+    pf.write_all(&[0u8; 32])?;
+    for &v in policy_rows {
+        pf.write_all(&v.to_le_bytes())?;
+    }
+
+    // index.bin: sequence of (u64 node_id, u32 row_index) in LE
+    let index_path = format!("{}/index.bin", out_dir);
+    let mut inf = File::create(&index_path)?;
+    for (node_id, row_idx) in nodes.iter() {
+        inf.write_all(&node_id.to_le_bytes())?;
+        let r: u32 = (*row_idx) as u32;
+        inf.write_all(&r.to_le_bytes())?;
+    }
     Ok(())
 }
