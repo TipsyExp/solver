@@ -1,0 +1,333 @@
+*** Begin Patch
+*** Update File: hu_solver/native/Cargo.toml
+@@
+ [dependencies]
+ sha2 = "0.10"
+ hex = "0.4"
++plotters = { version = "0.3.5", default-features = false, features = ["bitmap"] }
+
+*** End Patch
+*** Update File: hu_solver/native/src/lib.rs
+@@
+ use sha2::{Digest, Sha256};
++use plotters::prelude::*;
+@@
+ #[pymethods]
+ impl SolverNative {
+@@
+-    #[pyo3(signature = (iters, out_dir))]
+-    fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
+-        let iters = iters.unwrap_or(120_000);
+-        create_dir_all(out_dir).ok();
+-        for i in 0..iters {
++    /// minimal ES‑MCCFR + CFR+ over a tiny HU subgame (preflop+flop).
++    /// Runs for the given number of iterations (default 120 000) and writes
++    /// periodic checkpoints and a metrics plot.
++    #[pyo3(signature = (iters=None, out_dir))]
++    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
++        let total_iters: u64 = iters.unwrap_or(120_000);
++        create_dir_all(out_dir).ok();
++        // accumulate (iteration, l2_regret_norm) for plotting
++        let mut metrics: Vec<(u64, f32)> = Vec::new();
++        for i in 0..total_iters {
+             let iter_seed = splitmix64(self.seed ^ (i + 1));
+             let mut rng = StdRng::seed_from_u64(iter_seed);
+             let (row, legal_mask) = self.sample_row_and_mask(&mut rng);
+@@
+             for a in 0..ACTIONS_PER_NODE {
+                 self.strategy_sum[base + a] += sigma[a];
+             }
+ 
+-            if i % 50_000 == 0 {
+-                let mut mf = File::options()
+-                    .create(true)
+-                    .append(true)
+-                    .open(format!("{out_dir}/metrics.csv"))
+-                    .unwrap();
+-                let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
+-                writeln!(mf, "{},{}", i, l2).ok();
+-            }
+-        }
+-        Ok(())
++            if i % 50_000 == 0 {
++                // compute L2 norm of regrets and log/checkpoint
++                let l2: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
++                metrics.push((i, l2));
++                let mut mf = File::options()
++                    .create(true)
++                    .append(true)
++                    .open(format!("{}/metrics.csv", out_dir))
++                    .unwrap();
++                writeln!(mf, "{},{}", i, l2).ok();
++                self.save_policy(out_dir)?;
++            }
++        }
++        // always record final iteration
++        let l2_final: f32 = self.regrets.iter().map(|x| x * x).sum::<f32>().sqrt();
++        metrics.push((total_iters, l2_final));
++        {
++            let mut mf = File::options()
++                .create(true)
++                .append(true)
++                .open(format!("{}/metrics.csv", out_dir))
++                .unwrap();
++            writeln!(mf, "{},{}", total_iters, l2_final).ok();
++        }
++        // save final checkpoint
++        self.save_policy(out_dir)?;
++        // generate a metrics plot if possible
++        let plot_path = format!("{}/metrics_plot.png", out_dir);
++        if let Err(e) = write_metrics_plot(&metrics, &plot_path) {
++            eprintln!("warn: failed to write metrics_plot.png: {:?}", e);
++        }
++        Ok(())
+     }
+@@
+-        let jam_legal = true; // tiny slice assumption
++        let jam_legal = true; // jam always allowed when stack permits in this slice
+         let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
+@@
+         let row = self.nodes.get(&nid).copied().unwrap_or(0);
+         let base = row * ACTIONS_PER_NODE;
+ 
+         // legal mask by street
+-        let mut legal = [false; ACTIONS_PER_NODE];
+-        legal[0] = true; // fold
+-        legal[1] = true; // check/call
+-        match street {
+-            0 => {
+-                // preflop
+-                legal[2] = true; // size A (2.5x)
+-                legal[3] = true; // size B (8x)
+-                legal[4] = false; // size C unused preflop
+-                legal[5] = true; // jam
+-            }
+-            1 => {
+-                // flop
+-                legal[2] = true; // 0.33p
+-                legal[3] = true; // 0.75p
+-                legal[4] = true; // 1.25p
+-                legal[5] = true; // jam
+-            }
+-            _ => {}
+-        }
++        let mut legal = [false; ACTIONS_PER_NODE];
++        // fold and check/call are always legal
++        legal[0] = true;
++        legal[1] = true;
++        // allow as many raises as configured for this street
++        let size_count = match street {
++            0 => self.preflop_sizes.len(),
++            1 => self.flop_sizes.len(),
++            _ => 0,
++        };
++        for idx_size in 0..3 {
++            legal[2 + idx_size] = idx_size < size_count;
++        }
++        // jam depends on legality flag
++        legal[5] = jam_legal;
+@@
+-        let mut probs = [0f32; ACTIONS_PER_NODE];
+-        let mut sum = 0f32;
+-        for a in 0..ACTIONS_PER_NODE {
+-            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0);
+-            let v = if legal[a] { p } else { 0.0 };
+-            probs[a] = v;
+-            sum += v;
+-        }
+-        if sum <= 0.0 {
+-            let k = legal.iter().filter(|&&b| b).count().max(1) as f32;
+-            for a in 0..ACTIONS_PER_NODE {
+-                probs[a] = if legal[a] { 1.0 / k } else { 0.0 };
+-            }
+-        } else {
+-            for a in 0..ACTIONS_PER_NODE {
+-                probs[a] /= sum;
+-            }
+-        }
+-
+-        // Build output dict (Bound)
+-        out.set_item("fold", probs[0])?;
+-        out.set_item("check_call", probs[1])?;
+-        out.set_item("size_A", probs[2])?;
+-        out.set_item("size_B", probs[3])?;
+-        out.set_item("size_C", probs[4])?;
+-        out.set_item("jam", probs[5])?;
+-        Ok(out.into_py(py))
++        let mut probs = [0f64; ACTIONS_PER_NODE];
++        let mut sum = 0f64;
++        for a in 0..ACTIONS_PER_NODE {
++            let p = *self.policy_rows.get(base + a).unwrap_or(&0.0) as f64;
++            let v = if legal[a] { p } else { 0.0 };
++            probs[a] = v;
++            sum += v;
++        }
++        let legal_idxs: Vec<usize> = (0..ACTIONS_PER_NODE).filter(|&i| legal[i]).collect();
++        if !legal_idxs.is_empty() {
++            if sum <= 0.0 {
++                let k = legal_idxs.len() as f64;
++                for &i in &legal_idxs {
++                    probs[i] = 1.0 / k;
++                }
++            } else {
++                for &i in &legal_idxs {
++                    probs[i] /= sum;
++                }
++            }
++            // adjust to make sum exactly 1
++            let mut idx_max = legal_idxs[0];
++            for &i in &legal_idxs {
++                if probs[i] > probs[idx_max] {
++                    idx_max = i;
++                }
++            }
++            let sum_others: f64 = legal_idxs
++                .iter()
++                .copied()
++                .filter(|&i| i != idx_max)
++                .map(|i| probs[i])
++                .sum();
++            probs[idx_max] = (1.0 - sum_others).max(0.0);
++        }
++        let out = PyDict::new_bound(py);
++        out.set_item("fold", probs[0])?;
++        out.set_item("check_call", probs[1])?;
++        out.set_item("size_A", probs[2])?;
++        out.set_item("size_B", probs[3])?;
++        out.set_item("size_C", probs[4])?;
++        out.set_item("jam", probs[5])?;
++        Ok(out.into_py(py))
+     }
+ }
+ 
+ /// ---- helpers ----
+@@
+ impl SolverNative {
+@@
+     fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
+         let rows = self.nodes.len();
+         let idx = (rng.gen::<u64>() as usize) % rows;
+-        let node_id = self.nodes.iter().nth(idx).unwrap().0;
+-        let street = ((node_id >> 8) & 0x3) as u8;
+-        let mut mask = [false; ACTIONS_PER_NODE];
+-        mask[0] = true;
+-        mask[1] = true;
+-        if street == 0 {
+-            mask[2] = true;
+-            mask[3] = true;
+-            mask[4] = false;
+-            mask[5] = true;
+-        } else {
+-            mask[2] = true;
+-            mask[3] = true;
+-            mask[4] = true;
+-            mask[5] = true;
+-        }
+-        (idx, mask)
++        let (node_id, row_idx) = self.nodes.iter().nth(idx).unwrap();
++        let street = ((node_id >> 8) & 0x3) as u8;
++        let mut mask = [false; ACTIONS_PER_NODE];
++        // fold and call always legal
++        mask[0] = true;
++        mask[1] = true;
++        let size_count = match street {
++            0 => self.preflop_sizes.len(),
++            1 => self.flop_sizes.len(),
++            _ => 0,
++        };
++        for idx_size in 0..3 {
++            mask[2 + idx_size] = idx_size < size_count;
++        }
++        // jam always allowed in this tiny slice
++        mask[5] = true;
++        (*row_idx, mask)
+     }
+ }
+ 
++/// Write a simple line plot to a PNG using plotters.  Takes pairs of (iteration,l2).
++fn write_metrics_plot(data: &Vec<(u64, f32)>, path: &str) -> Result<(), Box<dyn std::error::Error>> {
++    if data.is_empty() {
++        return Ok(());
++    }
++    let max_iter = data.iter().map(|(i, _)| *i as f32).fold(0.0_f32, f32::max);
++    let max_val = data.iter().map(|(_, v)| *v).fold(0.0_f32, f32::max);
++    let width = 640;
++    let height = 480;
++    let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
++    root.fill(&WHITE)?;
++    let mut chart = ChartBuilder::on(&root)
++        .caption("L2 Regret Norm vs Iterations", ("sans-serif", 20))
++        .margin(10)
++        .x_label_area_size(30)
++        .y_label_area_size(40)
++        .build_cartesian_2d(0f32..max_iter, 0f32..max_val)?;
++    chart
++        .configure_mesh()
++        .x_desc("iteration")
++        .y_desc("l2_regret_norm")
++        .draw()?;
++    chart
++        .draw_series(LineSeries::new(
++            data.iter().map(|(i, v)| (*i as f32, *v)),
++            &BLUE,
++        ))?
++        .label("l2_regret_norm")
++        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
++    chart
++        .configure_series_labels()
++        .border_style(&BLACK)
++        .draw()?;
++    root.present()?;
++    Ok(())
++}
+*** End Patch
+*** Add File: hu_solver/tests/test_policy_determinism.py
++import os
++import shutil
++import tempfile
++import hashlib
++
++import pytest
++
++try:
++    from hu_solver_native import SolverNative
++except ImportError:
++    pytest.skip("native extension not available", allow_module_level=True)
++
++
++def sha256_of_file(path: str) -> str:
++    """Compute SHA256 hex of the given file."""
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(8192), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def train_and_hash(seed: int, iters: int = 5000):
++    """Train a solver with the given seed and return policy/index checksums."""
++    tmpdir = tempfile.mkdtemp()
++    try:
++        s = SolverNative(seed=seed)
++        s.train(iters=iters, out_dir=tmpdir)
++        policy_bin = os.path.join(tmpdir, "policy.bin")
++        index_bin = os.path.join(tmpdir, "index.bin")
++        return sha256_of_file(policy_bin), sha256_of_file(index_bin)
++    finally:
++        shutil.rmtree(tmpdir)
++
++
++def test_policy_determinism_same_seed():
++    """Same seed → identical checksums for policy and index."""
++    h1, i1 = train_and_hash(seed=42)
++    h2, i2 = train_and_hash(seed=42)
++    assert h1 == h2, "policy.bin checksum differs for same seed"
++    assert i1 == i2, "index.bin checksum differs for same seed"
++
++
++def test_policy_determinism_different_seed():
++    """Different seeds → at least one of the files must differ."""
++    h1, i1 = train_and_hash(seed=1)
++    h2, i2 = train_and_hash(seed=2)
++    assert h1 != h2 or i1 != i2, "policy/index checksums should differ for different seeds"
+*** End Patch
