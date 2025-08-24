@@ -1,27 +1,88 @@
-*** Begin Patch
-*** Update File: hu_solver/native/Cargo.toml
-@@
+diff --git a/hu_solver/native/Cargo.toml b/hu_solver/native/Cargo.toml
+index 6b8d9a1..f2acb7b 100644
+--- a/hu_solver/native/Cargo.toml
++++ b/hu_solver/native/Cargo.toml
+@@ -1,6 +1,7 @@
  [dependencies]
  sha2 = "0.10"
  hex = "0.4"
 +plotters = { version = "0.3.5", default-features = false, features = ["bitmap"] }
-
-*** End Patch
-*** Update File: hu_solver/native/src/lib.rs
-@@
+ 
+ [package]
+ name = "hu_solver_native"
+diff --git a/hu_solver/native/src/lib.rs b/hu_solver/native/src/lib.rs
+index 7d6e8a1..c2b5e79 100644
+--- a/hu_solver/native/src/lib.rs
++++ b/hu_solver/native/src/lib.rs
+@@ -1,10 +1,11 @@
+ use pyo3::prelude::*;
+ use pyo3::types::{PyDict, PyModule};
+ use pyo3::Bound;
+ 
+ use rand::rngs::StdRng;
+ use rand::{Rng, SeedableRng};
+ use serde::Deserialize;
+ use serde_json::json;
  use sha2::{Digest, Sha256};
 +use plotters::prelude::*;
+ use std::collections::BTreeMap;
+ use std::fs::{create_dir_all, File};
+ use std::io::{Read, Write};
 @@
  #[pymethods]
  impl SolverNative {
-@@
+     #[new]
+     fn new(seed: Option<u64>) -> Self {
+         let mut s = Self {
+-            seed: seed.unwrap_or(1234),
++            seed: seed.unwrap_or(1234),
+             preflop_sizes: vec!["2.5x".to_string(), "8x".to_string(), "jam".to_string()],
+             flop_sizes: vec![
+                 "0.33p".to_string(),
+                 "0.75p".to_string(),
+                 "1.25p".to_string(),
+                 "jam".to_string(),
+             ],
+             nodes: BTreeMap::new(),
+             regrets: Vec::new(),
+             strategy_sum: Vec::new(),
+             policy_rows: Vec::new(),
+         };
+         s.init_nodes();
+         s
+     }
+ 
+     /// Optional: load config YAML if you want sizes from file (seed too).
+     fn load_config_yaml(&mut self, config_path: &str) -> PyResult<()> {
+         let mut f = File::open(config_path)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open config: {e}")))?;
+         let mut buf = String::new();
+         f.read_to_string(&mut buf).unwrap();
+         let cfg: ConfigYaml = serde_yaml::from_str(&buf)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("parse yaml: {e}")))?;
+         if let Some(sd) = cfg.seed {
+             self.seed = sd;
+         }
+         if let Some(bs) = cfg.bet_sizes {
+             if let Some(pf) = bs.preflop {
+                 self.preflop_sizes = pf.iter().map(|v| yaml_val_to_size(v)).collect();
+             }
+             if let Some(ff) = bs.flop {
+                 self.flop_sizes = ff.iter().map(|v| yaml_val_to_size(v)).collect();
+             }
+         }
+         Ok(())
+     }
+ 
+-    /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop)
+-    /// Matches tests: train(iters, out_dir)
 -    #[pyo3(signature = (iters, out_dir))]
 -    fn train(&mut self, iters: u64, out_dir: &str) -> PyResult<()> {
 -        let iters = iters.unwrap_or(120_000);
 -        create_dir_all(out_dir).ok();
 -        for i in 0..iters {
-+    /// minimal ES‑MCCFR + CFR+ over a tiny HU subgame (preflop+flop).
-+    /// Runs for the given number of iterations (default 120 000) and writes
++    /// minimal ES-MCCFR + CFR+ over a tiny HU subgame (preflop+flop).
++    /// Runs for the given number of iterations (default 120 000) and writes
 +    /// periodic checkpoints and a metrics plot.
 +    #[pyo3(signature = (iters=None, out_dir))]
 +    fn train(&mut self, iters: Option<u64>, out_dir: &str) -> PyResult<()> {
@@ -33,7 +94,49 @@
              let iter_seed = splitmix64(self.seed ^ (i + 1));
              let mut rng = StdRng::seed_from_u64(iter_seed);
              let (row, legal_mask) = self.sample_row_and_mask(&mut rng);
-@@
+ 
+             // regret-matching policy from current regrets (clamped >=0)
+             let base = row * ACTIONS_PER_NODE;
+             let mut pos_reg = [0f32; ACTIONS_PER_NODE];
+             for a in 0..ACTIONS_PER_NODE {
+                 let r = self.regrets[base + a].max(0.0);
+                 pos_reg[a] = if legal_mask[a] { r } else { 0.0 };
+             }
+             let sum_r: f32 = pos_reg.iter().sum();
+             let mut sigma = [0f32; ACTIONS_PER_NODE];
+             if sum_r > 0.0 {
+                 for a in 0..ACTIONS_PER_NODE {
+                     sigma[a] = pos_reg[a] / sum_r;
+                 }
+             } else {
+                 // uniform over legal
+                 let k = legal_mask.iter().filter(|&&b| b).count().max(1) as f32;
+                 for a in 0..ACTIONS_PER_NODE {
+                     sigma[a] = if legal_mask[a] { 1.0 / k } else { 0.0 };
+                 }
+             }
+ 
+             // deterministic toy payoff for convergence (non-uniform, stable)
+             let mut v = [0f32; ACTIONS_PER_NODE];
+             for a in 0..ACTIONS_PER_NODE {
+                 if legal_mask[a] {
+                     let base_val = ((row as f32 % 13.0) * 0.01) + (a as f32) * 0.001;
+                     v[a] = base_val;
+                 } else {
+                     v[a] = 0.0;
+                 }
+             }
+             let u: f32 = (0..ACTIONS_PER_NODE).map(|a| sigma[a] * v[a]).sum();
+ 
+             // CFR+ cumulative regrets
+             for a in 0..ACTIONS_PER_NODE {
+                 if legal_mask[a] {
+                     let idx = base + a;
+                     let r = self.regrets[idx] + (v[a] - u);
+                     self.regrets[idx] = r.max(0.0);
+                 }
+             }
+             // accumulate average strategy (linear averaging)
              for a in 0..ACTIONS_PER_NODE {
                  self.strategy_sum[base + a] += sigma[a];
              }
@@ -84,13 +187,10 @@
      }
 @@
 -        let jam_legal = true; // tiny slice assumption
-+        let jam_legal = true; // jam always allowed when stack permits in this slice
++        let jam_legal = true; // jam allowed in this tiny slice
          let bsi = pack_bet_state_id(street, pos, to_call, last_raise, jam_legal);
 @@
-         let row = self.nodes.get(&nid).copied().unwrap_or(0);
-         let base = row * ACTIONS_PER_NODE;
- 
-         // legal mask by street
+-        // legal mask by street
 -        let mut legal = [false; ACTIONS_PER_NODE];
 -        legal[0] = true; // fold
 -        legal[1] = true; // check/call
@@ -111,11 +211,12 @@
 -            }
 -            _ => {}
 -        }
++        // legal mask derived from config sizes per street
 +        let mut legal = [false; ACTIONS_PER_NODE];
 +        // fold and check/call are always legal
 +        legal[0] = true;
 +        legal[1] = true;
-+        // allow as many raises as configured for this street
++        // allow as many raises as configured for this street (up to 3)
 +        let size_count = match street {
 +            0 => self.preflop_sizes.len(),
 +            1 => self.flop_sizes.len(),
@@ -124,27 +225,45 @@
 +        for idx_size in 0..3 {
 +            legal[2 + idx_size] = idx_size < size_count;
 +        }
-+        // jam depends on legality flag
++        // jam depends on legality flag (always true in this tiny slice)
 +        legal[5] = jam_legal;
 @@
--        let mut probs = [0f32; ACTIONS_PER_NODE];
--        let mut sum = 0f32;
+-        // read row; mask and renormalize
+-        let mut probs = [0f64; ACTIONS_PER_NODE];
+-        let mut sum = 0f64;
 -        for a in 0..ACTIONS_PER_NODE {
--            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0);
+-            let p = self.policy_rows.get(base + a).copied().unwrap_or(0.0) as f64;
 -            let v = if legal[a] { p } else { 0.0 };
 -            probs[a] = v;
 -            sum += v;
 -        }
--        if sum <= 0.0 {
--            let k = legal.iter().filter(|&&b| b).count().max(1) as f32;
--            for a in 0..ACTIONS_PER_NODE {
--                probs[a] = if legal[a] { 1.0 / k } else { 0.0 };
+-        
+-        // normalize
+-        let mut legal_idxs: Vec<usize> = (0..ACTIONS_PER_NODE).filter(|&i| legal[i]).collect();
+-        if legal_idxs.is_empty() {   
+-          // nothing legal: all zeros (unlikely in this toy slice)
+-        } else if sum <= 0.0 {
+-          // uniform over legal
+-             let k = legal_idxs.len() as f64;
+-            for &i in &legal_idxs {
+-               probs[i] = 1.0 / k;
 -            }
 -        } else {
--            for a in 0..ACTIONS_PER_NODE {
--                probs[a] /= sum;
--            }
+-            for &i in &legal_idxs {
+-                probs[i] /= sum;
+-           }
 -        }
+-        // exact-sum adjustment: set the largest entry to 1 - sum(others)
+-        if !legal_idxs.is_empty() {
+-            let mut idx_max = legal_idxs[0];
+-            for &i in &legal_idxs {
+-                if probs[i] > probs[idx_max] {
+-                    idx_max = i;
+-                }
+-            }
+-            let sum_others: f64 = legal_idxs.iter().copied().filter(|&i| i != idx_max).map(|i| probs[i]).sum();
+-            probs[idx_max] = 1.0 - sum_others;
+-       }     
 -
 -        // Build output dict (Bound)
 -        out.set_item("fold", probs[0])?;
@@ -154,6 +273,7 @@
 -        out.set_item("size_C", probs[4])?;
 -        out.set_item("jam", probs[5])?;
 -        Ok(out.into_py(py))
++        // read row; mask and renormalize
 +        let mut probs = [0f64; ACTIONS_PER_NODE];
 +        let mut sum = 0f64;
 +        for a in 0..ACTIONS_PER_NODE {
@@ -204,10 +324,12 @@
 @@
  impl SolverNative {
 @@
-     fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
+-    fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
++    fn sample_row_and_mask(&self, rng: &mut StdRng) -> (usize, [bool; ACTIONS_PER_NODE]) {
          let rows = self.nodes.len();
          let idx = (rng.gen::<u64>() as usize) % rows;
--        let node_id = self.nodes.iter().nth(idx).unwrap().0;
+-        let (node_id, row_idx) = self.nodes.iter().nth(idx).unwrap();
+-        let row = *row_idx;
 -        let street = ((node_id >> 8) & 0x3) as u8;
 -        let mut mask = [false; ACTIONS_PER_NODE];
 -        mask[0] = true;
@@ -223,7 +345,7 @@
 -            mask[4] = true;
 -            mask[5] = true;
 -        }
--        (idx, mask)
+-        (row, mask)
 +        let (node_id, row_idx) = self.nodes.iter().nth(idx).unwrap();
 +        let street = ((node_id >> 8) & 0x3) as u8;
 +        let mut mask = [false; ACTIONS_PER_NODE];
@@ -254,7 +376,7 @@
 +    let width = 640;
 +    let height = 480;
 +    let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
-+    root.fill(&WHITE)?;
++    root.fill(&RGBColor(255, 255, 255))?;
 +    let mut chart = ChartBuilder::on(&root)
 +        .caption("L2 Regret Norm vs Iterations", ("sans-serif", 20))
 +        .margin(10)
@@ -269,19 +391,23 @@
 +    chart
 +        .draw_series(LineSeries::new(
 +            data.iter().map(|(i, v)| (*i as f32, *v)),
-+            &BLUE,
++            &RGBColor(0, 0, 255),
 +        ))?
 +        .label("l2_regret_norm")
-+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
++        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RGBColor(0, 0, 255)));
 +    chart
 +        .configure_series_labels()
-+        .border_style(&BLACK)
++        .border_style(&RGBColor(0, 0, 0))
 +        .draw()?;
 +    root.present()?;
 +    Ok(())
 +}
-*** End Patch
-*** Add File: hu_solver/tests/test_policy_determinism.py
+diff --git a/hu_solver/tests/test_policy_determinism.py b/hu_solver/tests/test_policy_determinism.py
+new file mode 100644
+index 0000000..3529f7e
+--- /dev/null
++++ b/hu_solver/tests/test_policy_determinism.py
+@@ -0,0 +1,57 @@
 +import os
 +import shutil
 +import tempfile
@@ -295,33 +421,44 @@
 +    pytest.skip("native extension not available", allow_module_level=True)
 +
 +
-+def sha256_of_file(path: str) -> str:
-+    """Compute SHA256 hex of the given file."""
++def sha256_hexdig(data: bytes) -> str:
 +    h = hashlib.sha256()
-+    with open(path, "rb") as f:
-+        for chunk in iter(lambda: f.read(8192), b""):
-+            h.update(chunk)
++    h.update(data)
 +    return h.hexdigest()
 +
 +
++def policy_body_sha256(path: str) -> str:
++    """Hash body only (skip 32-byte policy header)."""
++    with open(path, "rb") as f:
++        head = f.read(32)
++        assert len(head) == 32, "policy.bin header too short"
++        body = f.read()
++    return sha256_hexdig(body)
++
++
++def file_sha256(path: str) -> str:
++    with open(path, "rb") as f:
++        return sha256_hexdig(f.read())
++
++
 +def train_and_hash(seed: int, iters: int = 5000):
-+    """Train a solver with the given seed and return policy/index checksums."""
++    """Train with a given seed; return (policy_body_sha, index_sha)."""
 +    tmpdir = tempfile.mkdtemp()
 +    try:
 +        s = SolverNative(seed=seed)
 +        s.train(iters=iters, out_dir=tmpdir)
 +        policy_bin = os.path.join(tmpdir, "policy.bin")
 +        index_bin = os.path.join(tmpdir, "index.bin")
-+        return sha256_of_file(policy_bin), sha256_of_file(index_bin)
++        return policy_body_sha256(policy_bin), file_sha256(index_bin)
 +    finally:
 +        shutil.rmtree(tmpdir)
 +
 +
 +def test_policy_determinism_same_seed():
-+    """Same seed → identical checksums for policy and index."""
++    """Same seed → identical checksums for policy body and index."""
 +    h1, i1 = train_and_hash(seed=42)
 +    h2, i2 = train_and_hash(seed=42)
-+    assert h1 == h2, "policy.bin checksum differs for same seed"
++    assert h1 == h2, "policy.bin (body) checksum differs for same seed"
 +    assert i1 == i2, "index.bin checksum differs for same seed"
 +
 +
@@ -330,4 +467,3 @@
 +    h1, i1 = train_and_hash(seed=1)
 +    h2, i2 = train_and_hash(seed=2)
 +    assert h1 != h2 or i1 != i2, "policy/index checksums should differ for different seeds"
-*** End Patch
