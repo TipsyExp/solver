@@ -1,12 +1,21 @@
 {
   "name": "hu-solver-native",
-  "build": { "dockerfile": "Dockerfile" },
-  "features": {},
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest"
+    }
+  },
   "postCreateCommand": "pip install -U pip maturin numpy jsonschema pyyaml",
   "customizations": {
     "vscode": {
-      "settings": { "python.defaultInterpreterPath": "/usr/local/bin/python" },
-      "extensions": ["ms-python.python", "rust-lang.rust-analyzer"]
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "rust-lang.rust-analyzer"
+      ]
     }
   }
 }
